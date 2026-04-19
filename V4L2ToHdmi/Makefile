@@ -1,12 +1,10 @@
+-include ../config.mk
+
 CC = aarch64-linux-gnu-gcc
 CFLAGS = -I/usr/include/libdrm -Wall -O2
 
 LDFLAGS = -L/usr/lib/aarch64-linux-gnu
 LIBS = -ldrm -lrga
-
-REMOTE_USER = lckfb
-REMOTE_IP = 10.225.235.41
-REMOTE_PATH = /home/lckfb
 
 TARGET1 = TEST_PURE_GREEN
 TARGET2 = TEST_A_FRAME
