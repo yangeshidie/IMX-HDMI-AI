@@ -16,6 +16,7 @@
 #include <rga/rga.h>
 
 /*************************** 0. 配置宏定义 ***************************/
+#define DRM_BPP             32
 #define DEV_CAMERA          "/dev/video11"
 #define DEV_DRM             "/dev/dri/card0"
 #define CAM_WIDTH           3840
@@ -37,7 +38,9 @@ typedef struct {
     int cameraFd;
     uint32_t width;
     uint32_t height;
+    uint32_t bufferCount;   
     buffer_info_t *buffers;
+    int *dma_fds;
     struct v4l2_format fmt;
 } camera_device_t;
 
@@ -46,11 +49,13 @@ typedef struct {
     uint32_t crtcId;
     uint32_t fbId;
     uint32_t handle;
+    int dma_fd;
     uint32_t *pixels;
     uint32_t pitch;
     uint64_t size;
     drmModeModeInfo mode;
     drmModeConnector *conn;
+    drmModeCrtc *savedCrtc;  
 } drm_device_t;
 
 /*************************** 2. 核心转换函数 ***************************/
@@ -84,36 +89,29 @@ static void sCpuNv12ToXrgbScale(uint8_t *srcNv12, uint32_t *dstXrgb,
 /**
  * @brief RGA 版：NV12 转 XRGB8888 + 缩放
  */
-static int sRgaNv12ToXrgbScale(uint8_t *srcPtr, uint8_t *dstPtr,
+static int sRgaNv12ToXrgbScale(int srcFd, int dstFd,
                                 int srcW, int srcH, int dstW, int dstH) {
     rga_info_t src = {0};
     rga_info_t dst = {0};
     
-    // 初始化 RGA 库
-    c_RkRgaInit();
-
-    // 设置源图信息 (NV12)
-    src.fd = -1;
+    // 源图信息 (使用 DMA FD)
+    src.fd = srcFd;
     src.mmuFlag = 1;
-    src.virAddr = srcPtr;
     src.format = RK_FORMAT_YCbCr_420_SP; // NV12
     rga_set_rect(&src.rect, 0, 0, srcW, srcH, srcW, srcH, RK_FORMAT_YCbCr_420_SP);
 
-    // 设置目标图信息 (XRGB8888)
-    dst.fd = -1;
+    // 目标图信息 (使用 DMA FD)
+    dst.fd = dstFd;
     dst.mmuFlag = 1;
-    dst.virAddr = dstPtr;
     dst.format = RK_FORMAT_XRGB_8888;
     rga_set_rect(&dst.rect, 0, 0, dstW, dstH, dstW, dstH, RK_FORMAT_XRGB_8888);
 
-    // 调用 RGA 进行合成、转换和缩放
     if (c_RkRgaBlit(&src, &dst, NULL) < 0) {
         fprintf(stderr, "RGA Blit 失败\n");
         return -1;
     }
     return 0;
 }
-
 /*************************** 3. 主程序逻辑 ***************************/
 
 int main() {
@@ -123,7 +121,7 @@ int main() {
     double cpuTime, rgaTime;
     drmModeRes *res;
     drmModeEncoder *enc;
-
+    c_RkRgaInit();
     /************************** 1. 打开设备节点 ****************************/
     cam.cameraFd = open(DEV_CAMERA, O_RDWR);
     drm.drmFd = open(DEV_DRM, O_RDWR | O_CLOEXEC);
@@ -159,6 +157,7 @@ int main() {
 
     cam.bufferCount = rqp.count;
     cam.buffers = calloc(cam.bufferCount, sizeof(buffer_info_t));
+    cam.dma_fds = calloc(cam.bufferCount, sizeof(int));
 
     for (uint32_t i = 0; i < cam.bufferCount; i++) {
         struct v4l2_buffer buf = {0};
@@ -175,9 +174,20 @@ int main() {
         cam.buffers[i].start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE, 
                                      MAP_SHARED, cam.cameraFd, planes[0].m.mem_offset);
         
-        // 预入队空缓冲区
+        // 导出 DMA FD
+        struct v4l2_exportbuffer expbuf = {0};
+        expbuf.type = CAM_BUF_TYPE;
+        expbuf.index = i;
+        if (ioctl(cam.cameraFd, VIDIOC_EXPBUF, &expbuf) == 0) {
+            cam.dma_fds[i] = expbuf.fd;
+        } else {
+            perror("VIDIOC_EXPBUF 失败");
+        }
+        
+        // 预入队空缓冲区 (只保留这一个)
         ioctl(cam.cameraFd, VIDIOC_QBUF, &buf);
     }
+
 
     /************************** 4. 配置 DRM 显示器 **************************/
     res = drmModeGetResources(drm.drmFd);
@@ -214,7 +224,9 @@ int main() {
 
     // 切换屏幕显示内容到新 FB
     drmModeSetCrtc(drm.drmFd, drm.crtcId, drm.fbId, 0, 0, &drm.conn->connector_id, 1, &drm.mode);
-
+    if (drmPrimeHandleToFD(drm.drmFd, drm.handle, 0, &drm.dma_fd) < 0) {
+            perror("DRM Buffer 导出 FD 失败");
+        }
     /************************** 6. 开启采集流 ****************************/
     enum v4l2_buf_type type = CAM_BUF_TYPE;
     ioctl(cam.cameraFd, VIDIOC_STREAMON, &type);
@@ -250,11 +262,12 @@ int main() {
 
         /************************** 8. 测试 RGA 转换速度 ****************************/
         clock_gettime(CLOCK_MONOTONIC, &start);
-        
-        sRgaNv12ToXrgbScale(camPtr, drmPtr, 
-                             CAM_WIDTH, CAM_HEIGHT, 
-                             drm.mode.hdisplay, drm.mode.vdisplay);
-        
+    
+        // 传入 V4L2 的当前帧 FD 和 DRM 的显存 FD
+        sRgaNv12ToXrgbScale(cam.dma_fds[vBuf.index], drm.dma_fd, 
+                            CAM_WIDTH, CAM_HEIGHT, 
+                            drm.mode.hdisplay, drm.mode.vdisplay);
+    
         clock_gettime(CLOCK_MONOTONIC, &end);
         rgaTime = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
         printf(" [RGA] 转换耗时: %.3f ms\n", rgaTime);
@@ -278,11 +291,16 @@ int main() {
         drmModeFreeCrtc(drm.savedCrtc);
     }
 
-    // 释放摄像头内存映射
+    // 释放摄像头内存映射 & 关闭 DMA FDs
     for (uint32_t i = 0; i < cam.bufferCount; i++) {
         munmap(cam.buffers[i].start, cam.buffers[i].length);
+        if (cam.dma_fds[i] > 0) close(cam.dma_fds[i]); // 新增：关闭 V4L2 的 FD
     }
     free(cam.buffers);
+    free(cam.dma_fds); // 新增：释放数组内存
+
+    // 关闭 DRM Dumb Buffer 的 FD
+    if (drm.dma_fd > 0) close(drm.dma_fd); // 新增
 
     // 释放 DRM 显存
     munmap(drm.pixels, drm.size);
@@ -294,6 +312,5 @@ int main() {
     close(cam.cameraFd);
     close(drm.drmFd);
 
-    return 0;
     return 0;
 }

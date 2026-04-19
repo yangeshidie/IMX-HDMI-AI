@@ -1,7 +1,8 @@
 CC = aarch64-linux-gnu-gcc
 CFLAGS = -I/usr/include/libdrm -Wall -O2
+
 LDFLAGS = -L/usr/lib/aarch64-linux-gnu
-LIBS = -ldrm
+LIBS = -ldrm -lrga
 
 REMOTE_USER = lckfb
 REMOTE_IP = 10.225.235.41
@@ -11,15 +12,17 @@ TARGET1 = TEST_PURE_GREEN
 TARGET2 = TEST_A_FRAME
 TARGET3 = TEST_DEVICE_CAMERA
 TARGET4 = TEST_A_FRAME_RGA
+TARGET5 = FINAL
 
-ALL_TARGETS = $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) 
+ALL_TARGETS = $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5)
 
 SRC1 = drm_green.c
 SRC2 = drm_Aframe.c
 SRC3 = camera_test.c
 SRC4 = drm_Aframe_RGA.c
+SRC5 = final_video_test.c
 
-all: $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) 
+all: $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5)
 
 $(TARGET1): $(SRC1)
 	$(CC) $< -o $@ $(CFLAGS) $(LDFLAGS) $(LIBS)
@@ -33,8 +36,11 @@ $(TARGET3): $(SRC3)
 $(TARGET4): $(SRC4)
 	$(CC) $< -o $@ $(CFLAGS) $(LDFLAGS) $(LIBS)
 
+$(TARGET5): $(SRC5)
+	$(CC) $< -o $@ $(CFLAGS) $(LDFLAGS) $(LIBS)
+
 clean:
-	rm -f $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4)
+	rm -f $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5)
 
 
 deploy:
@@ -54,5 +60,7 @@ run: deploy
 	@NEWEST_BIN=$$(ls -t $(ALL_TARGETS) 2>/dev/null | head -n 1); \
 	echo "正在远程执行: $$NEWEST_BIN ..."; \
 	ssh $(REMOTE_USER)@$(REMOTE_IP) "chmod +x $(REMOTE_PATH)/$$NEWEST_BIN && $(REMOTE_PATH)/$$NEWEST_BIN"
+
+
 
 .PHONY: all clean deploy run
