@@ -1,68 +1,65 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <linux/videodev2.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include <linux/videodev2.h>
+
+// 引入 RGA 库
+#include <rga/RgaApi.h>
+#include <rga/rga.h>
 
 /*************************** 0. 配置宏定义 ***************************/
 #define DEV_CAMERA          "/dev/video11"
 #define DEV_DRM             "/dev/dri/card0"
-
 #define CAM_WIDTH           3840
 #define CAM_HEIGHT          2160
 #define CAM_BUFFER_COUNT    4
 #define CAM_PIXEL_FMT       V4L2_PIX_FMT_NV12
 #define CAM_BUF_TYPE        V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
 
-#define DRM_BPP             32
 #define CLIP(x)             ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
 
 /*************************** 1. 结构体定义 ***************************/
 
-// 摄像头缓冲区信息
 typedef struct {
     void *start;
     size_t length;
 } buffer_info_t;
 
-// 摄像头设备结构体
 typedef struct {
     int cameraFd;
     uint32_t width;
     uint32_t height;
-    uint32_t bufferCount;
     buffer_info_t *buffers;
     struct v4l2_format fmt;
 } camera_device_t;
 
-// DRM 显示设备结构体
 typedef struct {
     int drmFd;
     uint32_t crtcId;
     uint32_t fbId;
     uint32_t handle;
+    uint32_t *pixels;
     uint32_t pitch;
     uint64_t size;
-    uint32_t *pixels;
     drmModeModeInfo mode;
     drmModeConnector *conn;
-    drmModeCrtc *savedCrtc;
 } drm_device_t;
 
-/*************************** 2. 图像处理函数 ***************************/
+/*************************** 2. 核心转换函数 ***************************/
 
 /**
- * @brief NV12 转 XRGB8888 并带缩放
- * 使用 static 关键字并加 s 前缀
+ * @brief CPU 版：NV12 转 XRGB8888 + 缩放
  */
-static void sNv12ToXrgbScale(uint8_t *srcNv12, uint32_t *dstXrgb, 
-                               int srcW, int srcH, int dstW, int dstH, int stride) {
+static void sCpuNv12ToXrgbScale(uint8_t *srcNv12, uint32_t *dstXrgb, 
+                                 int srcW, int srcH, int dstW, int dstH, int stride) {
     uint8_t *yPlane = srcNv12;
     uint8_t *uvPlane = srcNv12 + (stride * srcH);
 
@@ -75,22 +72,55 @@ static void sNv12ToXrgbScale(uint8_t *srcNv12, uint32_t *dstXrgb,
             uint8_t U = uvPlane[(srcY / 2) * stride + (srcX / 2) * 2];
             uint8_t V = uvPlane[(srcY / 2) * stride + (srcX / 2) * 2 + 1];
 
-            int C = Y - 16;
-            int D = U - 128;
-            int E = V - 128;
-            
+            int C = Y - 16; int D = U - 128; int E = V - 128;
             int R = CLIP((298 * C           + 409 * E + 128) >> 8);
             int G = CLIP((298 * C - 100 * D - 208 * E + 128) >> 8);
             int B = CLIP((298 * C + 516 * D           + 128) >> 8);
-
             dstXrgb[y * dstW + x] = (R << 16) | (G << 8) | B;
         }
     }
 }
 
+/**
+ * @brief RGA 版：NV12 转 XRGB8888 + 缩放
+ */
+static int sRgaNv12ToXrgbScale(uint8_t *srcPtr, uint8_t *dstPtr,
+                                int srcW, int srcH, int dstW, int dstH) {
+    rga_info_t src = {0};
+    rga_info_t dst = {0};
+    
+    // 初始化 RGA 库
+    c_RkRgaInit();
+
+    // 设置源图信息 (NV12)
+    src.fd = -1;
+    src.mmuFlag = 1;
+    src.virAddr = srcPtr;
+    src.format = RK_FORMAT_YCbCr_420_SP; // NV12
+    rga_set_rect(&src.rect, 0, 0, srcW, srcH, srcW, srcH, RK_FORMAT_YCbCr_420_SP);
+
+    // 设置目标图信息 (XRGB8888)
+    dst.fd = -1;
+    dst.mmuFlag = 1;
+    dst.virAddr = dstPtr;
+    dst.format = RK_FORMAT_XRGB_8888;
+    rga_set_rect(&dst.rect, 0, 0, dstW, dstH, dstW, dstH, RK_FORMAT_XRGB_8888);
+
+    // 调用 RGA 进行合成、转换和缩放
+    if (c_RkRgaBlit(&src, &dst, NULL) < 0) {
+        fprintf(stderr, "RGA Blit 失败\n");
+        return -1;
+    }
+    return 0;
+}
+
+/*************************** 3. 主程序逻辑 ***************************/
+
 int main() {
     camera_device_t cam = {0};
     drm_device_t drm = {0};
+    struct timespec start, end;
+    double cpuTime, rgaTime;
     drmModeRes *res;
     drmModeEncoder *enc;
 
@@ -185,34 +215,59 @@ int main() {
     // 切换屏幕显示内容到新 FB
     drmModeSetCrtc(drm.drmFd, drm.crtcId, drm.fbId, 0, 0, &drm.conn->connector_id, 1, &drm.mode);
 
-    /************************** 6. 开启采集流并处理 *************************/
+    /************************** 6. 开启采集流 ****************************/
     enum v4l2_buf_type type = CAM_BUF_TYPE;
     ioctl(cam.cameraFd, VIDIOC_STREAMON, &type);
 
-    struct v4l2_buffer buf = {0};
+    struct v4l2_buffer vBuf = {0};
     struct v4l2_plane planes[1] = {0};
-    buf.type = CAM_BUF_TYPE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.length = 1;
-    buf.m.planes = planes;
+    vBuf.type = CAM_BUF_TYPE;
+    vBuf.memory = V4L2_MEMORY_MMAP;
+    vBuf.length = 1;
+    vBuf.m.planes = planes;
 
-    if (ioctl(cam.cameraFd, VIDIOC_DQBUF, &buf) == 0) {
-        int actualStride = cam.fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+    if (ioctl(cam.cameraFd, VIDIOC_DQBUF, &vBuf) == 0) {
+        int stride = cam.fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+        uint8_t *camPtr = (uint8_t *)cam.buffers[vBuf.index].start;
+        uint8_t *drmPtr = (uint8_t *)drm.pixels;
+
+        printf("\n>>> 开始性能对比实验 (4K NV12 -> %dx%d XRGB) <<<\n", drm.mode.hdisplay, drm.mode.vdisplay);
+
+        /************************** 7. 测试 CPU 转换速度 ****************************/
+        clock_gettime(CLOCK_MONOTONIC, &start);
         
-        // 核心转换与缩放
-        sNv12ToXrgbScale((uint8_t *)cam.buffers[buf.index].start, 
-                         drm.pixels, 
-                         CAM_WIDTH, CAM_HEIGHT, 
-                         drm.mode.hdisplay, drm.mode.vdisplay, 
-                         actualStride);
+        sCpuNv12ToXrgbScale(camPtr, (uint32_t *)drmPtr, 
+                             CAM_WIDTH, CAM_HEIGHT, 
+                             drm.mode.hdisplay, drm.mode.vdisplay, stride);
+        
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        cpuTime = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
+        printf(" [CPU] 转换耗时: %.3f ms\n", cpuTime);
 
-        printf("采集成功，已显示在屏幕。按回车键退出...\n");
+        // 清屏，防止视觉干扰
+        memset(drmPtr, 0, drm.size);
+        sleep(1);
+
+        /************************** 8. 测试 RGA 转换速度 ****************************/
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        
+        sRgaNv12ToXrgbScale(camPtr, drmPtr, 
+                             CAM_WIDTH, CAM_HEIGHT, 
+                             drm.mode.hdisplay, drm.mode.vdisplay);
+        
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        rgaTime = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
+        printf(" [RGA] 转换耗时: %.3f ms\n", rgaTime);
+
+        /************************** 9. 结果分析 ****************************/
+        printf("\n>>> 结论: RGA 速度是 CPU 的 %.2f 倍 <<<\n", cpuTime / rgaTime);
+        printf("按回车键退出...\n");
         getchar();
         
-        ioctl(cam.cameraFd, VIDIOC_QBUF, &buf);
+        ioctl(cam.cameraFd, VIDIOC_QBUF, &vBuf);
     }
 
-    /************************** 7. 恢复环境与资源释放 ***********************/
+    /************************** 10. 恢复环境与资源释放 ***********************/
     // 停止流
     ioctl(cam.cameraFd, VIDIOC_STREAMOFF, &type);
 
@@ -239,5 +294,6 @@ int main() {
     close(cam.cameraFd);
     close(drm.drmFd);
 
+    return 0;
     return 0;
 }
