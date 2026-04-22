@@ -17,6 +17,7 @@
 
 /*************************** 0. 配置宏定义 ***************************/
 #define TEST_TIME           15.0
+#define TEST_STREAM_TIME    900.0
 #define DRM_BPP             32
 #define DEV_CAMERA          "/dev/video11"
 #define DEV_DRM             "/dev/dri/card0"
@@ -35,7 +36,8 @@
 typedef enum {
     TEST_MODE_STREAMING = 0,  // 0: 仅视频流实时采集测试
     TEST_MODE_LIMIT     = 1,  // 1: 仅极限吞吐量压测
-    TEST_MODE_BOTH      = 2   // 2: 运行全部测试
+    TEST_MODE_BOTH      = 2,  // 2: 运行全部测试
+    TEST_MODE_STREAM    = 3   // 3: 15分钟RGA连续视频流测试
 } test_mode_t;
 
 typedef struct {
@@ -278,6 +280,79 @@ static void sRunLimitBenchmark(camera_device_t *cam, drm_device_t *drm, int use_
     printf("理论极限帧率: %.2f FPS  <--- 这是真实算力\n", max_fps);
     printf("理论最小延迟: %.2f ms\n", min_latency);
 }
+/**
+ * @brief 15分钟连续视频流稳定性测试函数 (仅限 RGA)
+ */
+static void sRunLongTimeStreamingTest(camera_device_t *cam, drm_device_t *drm) {
+    struct timespec test_start, current_time, last_sec_time;
+    struct timespec process_start, process_end;
+    
+    int frame_count = 0;       // 1秒内的帧数
+    int total_frames = 0;      // 总帧数
+    double total_process_time = 0.0; // 累计处理耗时
+
+    printf("\n======================================================\n");
+    printf(">>> 开始 15 分钟连续视频流测试 - 模式: [RGA 硬件加速] <<<\n");
+    printf("======================================================\n");
+
+    clock_gettime(CLOCK_MONOTONIC, &test_start);
+    last_sec_time = test_start;
+
+    // 循环条件：测试总时间未达到 TEST_STREAM_TIME 秒
+    while (1) {
+        clock_gettime(CLOCK_MONOTONIC, &current_time);
+        double elapsed_time = sGetTimeDiff(&test_start, &current_time);
+        if (elapsed_time >= TEST_STREAM_TIME) {
+            break; 
+        }
+
+        struct v4l2_buffer vBuf = {0};
+        struct v4l2_plane planes[1] = {0};
+        vBuf.type = CAM_BUF_TYPE;
+        vBuf.memory = V4L2_MEMORY_MMAP;
+        vBuf.length = 1;
+        vBuf.m.planes = planes;
+
+        // 1. 从摄像头取出一帧
+        if (ioctl(cam->cameraFd, VIDIOC_DQBUF, &vBuf) == 0) {
+            
+            // --- 记录处理开始时间 ---
+            clock_gettime(CLOCK_MONOTONIC, &process_start);
+
+            // 仅使用 RGA 转换
+            sRgaNv12ToBgraScale(cam->dma_fds[vBuf.index], drm->dma_fd, 
+                                CAM_WIDTH, CAM_HEIGHT, 
+                                drm->mode.hdisplay, drm->mode.vdisplay);
+
+            // --- 记录处理结束时间，并累加耗时 ---
+            clock_gettime(CLOCK_MONOTONIC, &process_end);
+            total_process_time += sGetTimeDiff(&process_start, &process_end);
+
+            frame_count++;
+            total_frames++;
+
+            // 2. 每隔 1 秒输出一次实时 FPS 和 进度
+            clock_gettime(CLOCK_MONOTONIC, &current_time);
+            if (sGetTimeDiff(&last_sec_time, &current_time) >= 1.0) {
+                int minutes = (int)elapsed_time / 60;
+                int seconds = (int)elapsed_time % 60;
+                printf("[RGA 15Min压测] 进度: %02d:%02d / 15:00, 当前帧率: %d FPS\n", 
+                        minutes, seconds, frame_count);
+                frame_count = 0; // 重置1秒计数器
+                last_sec_time = current_time;
+            }
+
+            // 3. 将空篮子还给摄像头
+            ioctl(cam->cameraFd, VIDIOC_QBUF, &vBuf);
+        }
+    }
+
+    // 测试结束，输出汇总报告
+    printf("\n--- [RGA] 15分钟测试完成 ---\n");
+    printf("总渲染帧数: %d 帧\n", total_frames);
+    printf("平均流帧率: %.2f FPS\n", total_frames / TEST_STREAM_TIME);
+    printf("平均单帧转换耗时: %.2f ms\n", (total_process_time / total_frames) * 1000.0);
+}
 /*************************** 3. 主程序逻辑 ***************************/
 
 int main(int argc, char **argv) {
@@ -288,19 +363,19 @@ int main(int argc, char **argv) {
 
     test_mode_t current_mode = TEST_MODE_BOTH; // 默认运行全部测试
     if (argc > 1) {
-        // 如果输入了 -h 或 --help，打印使用说明
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
             printf("用法: %s [测试模式]\n", argv[0]);
             printf("可选模式:\n");
             printf("  0 : 仅运行视频流实时采集测试 (Streaming Test)\n");
             printf("  1 : 仅运行极限吞吐量压测 (Limit Benchmark)\n");
             printf("  2 : 运行全部测试 (默认)\n");
+            printf("  3 : 运行 15 分钟连续视频流测试 (RGA长测)\n"); 
             return 0;
         }
         
-        // 解析用户输入的数字
         int mode_arg = atoi(argv[1]);
-        if (mode_arg >= 0 && mode_arg <= 2) {
+        // 将这里的 <= 2 改为 <= 3
+        if (mode_arg >= 0 && mode_arg <= 3) { 
             current_mode = (test_mode_t)mode_arg;
         } else {
             fprintf(stderr, "无效的测试模式！请使用 -h 查看帮助。\n");
@@ -465,6 +540,10 @@ int main(int argc, char **argv) {
             memset(drm.pixels, 0, drm.size);
             sleep(3);
             sRunLimitBenchmark(&cam, &drm, 1);
+            break;
+        case TEST_MODE_STREAM:
+            memset(drm.pixels, 0, drm.size);
+            sRunLongTimeStreamingTest(&cam, &drm); 
             break;
 
         default:
