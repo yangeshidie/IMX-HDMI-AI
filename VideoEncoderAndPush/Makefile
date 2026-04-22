@@ -6,17 +6,18 @@ CFLAGS = -I/usr/include/libdrm -Wall -O2
 LDFLAGS = -L/usr/lib/aarch64-linux-gnu
 LIBS = -ldrm -lrga
 
-TARGET1 = TEST_PURE_GREEN
+TARGET1 = TEST_BUFFER_YNC
 TARGET2 = TEST_A_FRAME
 TARGET3 = TEST_DEVICE_CAMERA
 TARGET4 = TEST_A_FRAME_RGA
 TARGET5 = FINAL
 
 ALL_TARGETS = $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5)
-REMOTE_PATH_SUB = CameraToHdmi
+REMOTE_PATH_SUB = encoder
+
 REMOTE_PATH1 = $(REMOTE_PATH)/$(REMOTE_PATH_SUB)
 
-SRC1 = drm_green.c
+SRC1 = buffer_YNC.c
 SRC2 = drm_Aframe.c
 SRC3 = camera_test.c
 SRC4 = drm_Aframe_RGA.c
