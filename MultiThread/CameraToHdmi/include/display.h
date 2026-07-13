@@ -1,14 +1,23 @@
 #ifndef _DISPLAY_H_
 #define _DISPLAY_H_
 
+#define _GNU_SOURCE 
+
+#include <stdio.h>
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include "common.h"
 
-#define DRM_BUFFER_COUNT 2 
-
+#define DRM_BUFFER_COUNT    2 
+#define DRM_BPP             32
 // 内部管理的单个 DRM Dumb Buffer 结构
 typedef struct {
     uint32_t handle;     // DRM handle (内部对象句柄)

@@ -1,10 +1,18 @@
 #ifndef _CAMERA_H_
 #define _CAMERA_H_
+#define _GNU_SOURCE 
 
+#include <stdlib.h>  
+#include <unistd.h>  
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <linux/videodev2.h>
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include "common.h"
 
 // 内部管理的单个摄像头缓冲区结构
@@ -35,12 +43,11 @@ typedef struct CameraContext {
     bool is_initialized;    // 是否已完成初始化
     bool is_streaming;      // 是否已经 STREAMON
 
-    // 5. 线程安全 (可选，视具体设计而定)
     // pthread_mutex_t lock; // 如果允许多线程同时调用 camera 的 API，则需要锁
 
 } CameraContext;
 
-int camera_init(CameraContext *ctx, const char *dev_name, int w, int h, int count);
+int camera_init(CameraContext *ctx, const char *dev_name, uint32_t w, uint32_t h, uint32_t count, uint32_t pixel_format, uint32_t buf_type);
 int camera_start(CameraContext *ctx);
 int camera_get_frame(CameraContext *ctx, Frame *frame);
 int camera_put_frame(CameraContext *ctx, const Frame *frame); // 归还 Buffer

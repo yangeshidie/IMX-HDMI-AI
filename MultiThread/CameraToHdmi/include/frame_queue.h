@@ -1,6 +1,5 @@
 #include "common.h"
 #include <pthread.h>
-
 #define FRAME_QUEUE_SIZE 8
 
 typedef struct {
@@ -16,4 +15,4 @@ typedef struct {
 int frame_queue_init(FrameQueue *queue);
 int frame_queue_push(FrameQueue *queue, const Frame *frame);
 int frame_queue_pop(FrameQueue *queue, Frame *frame);
-int frame_queue_destroy(FrameQueue *queue);
+int frame_queue_deinit(FrameQueue *queue);

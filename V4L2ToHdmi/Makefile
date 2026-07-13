@@ -1,7 +1,7 @@
 -include ../config.mk
 
 CC = aarch64-linux-gnu-gcc
-CFLAGS = -I/usr/include/libdrm -Wall -O2
+CFLAGS = -I/usr/include/libdrm -Wall -O2 -g -pthread
 
 LDFLAGS = -L/usr/lib/aarch64-linux-gnu
 LIBS = -ldrm -lrga
