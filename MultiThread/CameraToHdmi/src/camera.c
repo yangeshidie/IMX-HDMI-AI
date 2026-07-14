@@ -1,5 +1,6 @@
 #include "../include/camera.h"
 
+
 int camera_init(CameraContext *ctx, const char *dev_name, uint32_t w, uint32_t h, 
                 uint32_t count, uint32_t pixel_format, uint32_t buf_type)
 {
@@ -103,10 +104,89 @@ int camera_init(CameraContext *ctx, const char *dev_name, uint32_t w, uint32_t h
     ctx->is_initialized = true;
     return 0;
 }
-int camera_start(CameraContext *ctx);
-int camera_get_frame(CameraContext *ctx, Frame *frame);
-int camera_put_frame(CameraContext *ctx, const Frame *frame); // 归还 Buffer
-int camera_stop(CameraContext *ctx);
+
+int camera_start(CameraContext *ctx)
+{
+    if (!ctx || ctx->fd < 0) return -1;
+    if (ioctl(ctx->fd, VIDIOC_STREAMON, &ctx->buf_type) < 0) {
+        perror("开启视频流失败");
+        return -1;
+    }
+    ctx->is_streaming = true;
+    return 0;
+}
+
+int camera_get_frame(CameraContext *ctx, Frame *frame)
+{
+    if (!ctx || ctx->fd < 0 || frame == NULL) return -1;
+
+    struct v4l2_buffer vBuf = {0};
+    struct v4l2_plane planes[1] = {0};
+
+    vBuf.type = ctx->buf_type;
+    vBuf.memory = V4L2_MEMORY_MMAP;
+    vBuf.length = 1;
+    vBuf.m.planes = planes;
+
+    if (ioctl(ctx->fd, VIDIOC_DQBUF, &vBuf) < 0) {
+        perror("VIDIOC_DQBUF 出队失败");
+        return -1;
+    }
+
+    if (vBuf.index >= ctx->buffer_count) {
+        fprintf(stderr, "获取到的 Buffer index 超出范围!\n");
+        return -1;
+    }
+
+    ctx->buffers[vBuf.index].is_queued = false;
+
+    frame->dma_fd    = ctx->buffers[vBuf.index].dma_fd;
+    frame->timestamp = (uint64_t)vBuf.timestamp.tv_sec * 1000000 + vBuf.timestamp.tv_usec;
+    frame->index     = vBuf.index;
+    frame->width     = ctx->width;
+    frame->height    = ctx->height;
+    frame->format    = ctx->pixel_format; 
+
+    return 0; 
+}
+
+int camera_put_frame(CameraContext *ctx, const Frame *frame) 
+{
+    if (!ctx || ctx->fd < 0 || frame == NULL) return -1;
+
+    if (frame->index >= ctx->buffer_count) return -1;
+    if (ctx->buffers[frame->index].is_queued) {
+        return 0; 
+    }
+
+    struct v4l2_buffer buf = {0};
+    struct v4l2_plane planes[1] = {0};
+    buf.type = ctx->buf_type;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = frame->index;
+    buf.length = 1;
+    buf.m.planes = planes;
+
+    if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+        perror("VIDIOC_QBUF 归还 Buffer 失败");
+        return -1;
+    }
+
+    ctx->buffers[frame->index].is_queued = true;
+    return 0;
+}
+int camera_stop(CameraContext *ctx)
+{
+    if (!ctx || ctx->fd < 0) return -1;
+    if(ioctl(ctx->fd, VIDIOC_STREAMOFF, &ctx->buf_type) < 0)
+    {
+        perror("关闭视频流失败");
+        return -1;
+    }
+    ctx->is_streaming = false;
+    return 0;
+}
+
 int camera_deinit(CameraContext *ctx)
 {
     if (!ctx || !ctx->is_initialized) return 0; // 防御性检查，支持重复调用

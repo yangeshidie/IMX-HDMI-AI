@@ -130,8 +130,36 @@ err_fd:
     return -1;
 }
 // 获取后台 Buffer 的 Frame 信息，以便传给 RGA
-int display_get_back_frame(DisplayContext *ctx, Frame *drm_frame);
-int display_show(DisplayContext *ctx); 
+int display_get_back_frame(DisplayContext *ctx, Frame *drm_frame)
+{
+    if (!ctx || ctx->fd < 0 || drm_frame == NULL) return -1;
+
+    drm_frame->dma_fd = ctx->buffers[ctx->back_buf_idx].dma_fd; 
+    drm_frame->format = ctx->pixel_format;
+    drm_frame->height = ctx->height;
+    drm_frame->width  = ctx->width;
+    drm_frame->index  = ctx->back_buf_idx; 
+    
+    return 0;
+}
+
+int display_show(DisplayContext *ctx)
+{
+    if (!ctx || ctx->fd < 0) return -1;
+    uint32_t back_fb_id = ctx->buffers[ctx->back_buf_idx].fb_id;
+
+    if (drmModePageFlip(ctx->fd, ctx->crtc_id, back_fb_id, 0, NULL) < 0) {
+        if (drmModeSetCrtc(ctx->fd, ctx->crtc_id, back_fb_id, 0, 0, 
+                           &ctx->connector_id, 1, &ctx->mode) < 0) {
+            perror("DRM 切换画面失败");
+            return -1;
+        }
+    }
+    int temp = ctx->front_buf_idx;
+    ctx->front_buf_idx = ctx->back_buf_idx;
+    ctx->back_buf_idx = temp;
+    return 0;
+}
 int display_deinit(DisplayContext *ctx)
 {
     if (!ctx || !ctx->is_initialized) return 0;
