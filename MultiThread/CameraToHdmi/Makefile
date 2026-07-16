@@ -1,13 +1,19 @@
 -include ../../config.mk
 
-# 1. 编译器与路径配置
 CC = aarch64-linux-gnu-gcc
 INC_DIR = ./include
 SRC_DIR = ./src
+SYSROOT = /home/yanmobile/my_software/RKSDK/TaishanPi-3-Linux/debian/binary
 
-# 核心：加入 -I$(INC_DIR) 解决 VS Code 波浪线和头文件找不到的问题
-CFLAGS = -I$(INC_DIR) -I/usr/include/libdrm -Wall -O2 -g -pthread
-LDFLAGS = -L/usr/lib/aarch64-linux-gnu
+CFLAGS = -I$(INC_DIR) -Wall -O2 -g -pthread
+CFLAGS += --sysroot=$(SYSROOT)
+CFLAGS += -I$(SYSROOT)/usr/include
+CFLAGS += -I$(SYSROOT)/usr/include/libdrm   
+CFLAGS += -I$(SYSROOT)/usr/include/drm      
+
+LDFLAGS = --sysroot=$(SYSROOT)
+LDFLAGS += -L$(SYSROOT)/usr/lib/aarch64-linux-gnu
+
 LIBS = -ldrm -lrga
 
 # 2. 目标文件定义（最终只输出一个 TEST）

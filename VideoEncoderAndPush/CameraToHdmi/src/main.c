@@ -6,25 +6,36 @@
 #include <sys/time.h>
 #include <signal.h>
 
-#define DEV_CAMERA          "/dev/video11"
-#define DEV_DRM             "/dev/dri/card0"
-#define CAM_WIDTH           3840
-#define CAM_HEIGHT          2160
-#define CAM_BUFFER_COUNT    4
-#define CAM_PIXEL_FMT       V4L2_PIX_FMT_NV12
-#define CAM_BUF_TYPE        V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
-#define SIGNAL_CONTINUE     0
-#define SIGNAL_QUIT         1
-#define CLIP(x)             ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
+#define DEV_CAMERA                  "/dev/video11"
+#define DEV_DRM                     "/dev/dri/card0"
+
+#define CAM_WIDTH                   3840
+#define CAM_HEIGHT                  2160
+#define CAM_BUFFER_COUNT            4
+#define CAM_PIXEL_FMT               V4L2_PIX_FMT_NV12
+#define CAM_BUF_TYPE                V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+
+#define SIGNAL_CONTINUE             0
+#define SIGNAL_QUIT                 1
+
+#define CLIP(x)                     ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
+
+#define QUEUE_LENTH_DISPLAY         4
+#define QUEUE_LENTH_ENCODE          4
+#define QUEUE_LENTH_AI              1
 
 pthread_mutex_t quitMutex = PTHREAD_MUTEX_INITIALIZER;
 volatile sig_atomic_t g_quit = SIGNAL_CONTINUE;
 
 typedef struct 
 {
-    FrameQueue queue;
-    DisplayContext display;
-    CameraContext camera;
+    DisplayContext  display;     // 显示硬件上下文
+    CameraContext   camera;      // 摄像头硬件上下文
+
+    FrameQueue      display_q;   // 显示线程循环队列
+    FrameQueue      encode_q;    // 编码线程循环队列
+    FrameQueue      ai_q;        // AI线程循环队列
+
 } appContext;
 
 
@@ -33,7 +44,10 @@ int system_init(appContext *ctx, const char *dev_name_camera, const char *dev_na
 {
     if (camera_init(&ctx->camera, dev_name_camera, w, h, count, pixel_format, buf_type) < 0) return -1;
     if (display_init(&ctx->display, dev_name_display) < 0) return -1;
-    if (frame_queue_init(&ctx->queue) < 0) return -1;
+
+    if (frame_queue_init(&ctx->display_q, QUEUE_LENTH_DISPLAY) < 0) return -1;
+    if (frame_queue_init(&ctx->encode_q , QUEUE_LENTH_ENCODE ) < 0) return -1;
+    if (frame_queue_init(&ctx->ai_q     , QUEUE_LENTH_AI     ) < 0) return -1;
     return 0;
 }
 
@@ -42,52 +56,12 @@ int system_deinit(appContext* ctx)
     camera_stop(&ctx->camera);
     camera_deinit(&ctx->camera);
     display_deinit(&ctx->display);
-    frame_queue_deinit(&ctx->queue);
+
+    frame_queue_deinit(&ctx->display_q);
+    frame_queue_deinit(&ctx->encode_q );
+    frame_queue_deinit(&ctx->ai_q     );
     return 0;
 }
-
-void *cameraThread(void *arg)
-{
-    appContext *ctx = arg;
-    Frame frame;
-    if (camera_start(&ctx->camera) < 0)
-        return NULL;
-    while (!g_quit)
-    {
-        if (camera_get_frame(&ctx->camera, &frame) < 0)
-        {
-            if (g_quit)
-                break;
-            continue;
-        }
-        if (frame_queue_push(&ctx->queue, &frame) < 0)
-            break;
-    }
-    return NULL;
-}
-
-void* displayThread(void *arg)
-{
-    appContext *ctx = (appContext*)arg;
-    Frame src_frame; 
-    Frame dst_frame; 
-
-    printf("Display 线程启动...\n");
-    while (g_quit == SIGNAL_CONTINUE) {
-        if (frame_queue_pop(&ctx->queue, &src_frame) < 0) {
-            continue;
-        }
-        if (display_get_back_frame(&ctx->display, &dst_frame) == 0) {
-            if (rga_process_convert_scale(&src_frame, &dst_frame) == 0) {
-                display_show(&ctx->display);
-            }
-        }
-        camera_put_frame(&ctx->camera, &src_frame);
-    }
-    printf("Display 线程退出...\n");
-    return NULL;
-}
-
 
 void handle_sigint(int sig) {
     g_quit = SIGNAL_QUIT; 
@@ -106,16 +80,16 @@ int main()
     pthread_t tid_camera;
     pthread_t tid_display;
 
-    pthread_create(&tid_camera, NULL, cameraThread, &ctx);
-    pthread_create(&tid_display, NULL, displayThread, &ctx);
+    // pthread_create(&tid_camera, NULL, cameraThread, &ctx);
+    // pthread_create(&tid_display, NULL, displayThread, &ctx);
 
     while(g_quit == SIGNAL_CONTINUE) {
         pause(); 
     }
 
-    frame_queue_abort(&ctx.queue);
-    pthread_join(tid_camera, NULL);
-    pthread_join(tid_display, NULL);
+    // frame_queue_abort(&ctx.queue);
+    // pthread_join(tid_camera, NULL);
+    // pthread_join(tid_display, NULL);
 
     system_deinit(&ctx);
     printf("系统资源清理完毕，程序安全退出。\n");

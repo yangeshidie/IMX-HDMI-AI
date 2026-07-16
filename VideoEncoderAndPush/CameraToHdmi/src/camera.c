@@ -147,6 +147,9 @@ int camera_get_frame(CameraContext *ctx, Frame *frame)
     frame->height    = ctx->height;
     frame->format    = ctx->pixel_format; 
 
+    frame->camera_ctx = ctx; // 记录是从哪个摄像头出来的，为了以后归还
+    atomic_init(&frame->ref_count, 1); // 刚取出来时，默认引用计数为 1
+
     return 0; 
 }
 
@@ -223,4 +226,24 @@ int camera_deinit(CameraContext *ctx)
 
     ctx->is_initialized = false;
     return 0;
+}
+
+
+void frame_retain(Frame *frame)
+{
+    if (!frame) return;
+    atomic_fetch_add(&frame->ref_count, 1);
+}
+
+void frame_release(Frame *frame)
+{
+    if (!frame || !frame->camera_ctx) return;
+
+    // atomic_fetch_sub 返回的是减之前的值
+    // 如果减之前是 1，说明当前线程做完 ref-- 后，引用计数就变成了 0
+    // 这意味着所有下游消费者都已经用完这一帧了，可以真正归还给底层硬件了
+    if (atomic_fetch_sub(&frame->ref_count, 1) == 1) {
+        CameraContext *ctx = (CameraContext *)frame->camera_ctx;
+        camera_put_frame(ctx, frame);
+    }
 }
