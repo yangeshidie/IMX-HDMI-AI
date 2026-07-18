@@ -146,7 +146,7 @@ int camera_get_frame(CameraContext *ctx, Frame *frame)
     frame->width     = ctx->width;
     frame->height    = ctx->height;
     frame->format    = ctx->pixel_format; 
-
+    frame->size      = vBuf.m.planes[0].length;
     frame->camera_ctx = ctx; // 记录是从哪个摄像头出来的，为了以后归还
     atomic_init(&ctx->buffers[vBuf.index].ref_count, 1); // 刚取出来时，默认引用计数为 1
 

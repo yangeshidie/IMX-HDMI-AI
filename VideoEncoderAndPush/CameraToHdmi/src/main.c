@@ -13,7 +13,7 @@
 
 #define DEV_CAMERA                  "/dev/video11"
 #define DEV_DRM                     "/dev/dri/card0"
-#define VERSION                     "1.1：MPP对齐官方\n"
+#define VERSION                     "1.1.3：MPP对齐官方:使用另一个宏\n"
 
 #define CAM_WIDTH                   3840
 #define CAM_HEIGHT                  2160
@@ -121,7 +121,6 @@ void* cameraThread(void *arg)
 #endif
         frame_release(&frame); 
     }
-
     printf("[Camera] 线程安全退出。\n");
     return NULL;
 }
@@ -176,10 +175,8 @@ void* encoderThread(void *arg)
             }
             mpp_encoder_release_packet(&out_packet);
         }
-
         frame_release(&cam_frame);
     }
-
     if (fp) {
         fclose(fp);
     }

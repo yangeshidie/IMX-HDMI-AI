@@ -15,6 +15,10 @@
 #include <sys/mman.h>
 #include "common.h"
 
+#ifndef MPP_ALIGN
+#define MPP_ALIGN(x, a)         (((x)+(a)-1)&~((a)-1))
+#endif
+
 // 内部管理的单个摄像头缓冲区结构
 typedef struct {
     void *start;         // mmap 的用户空间虚拟地址 (用于释放)

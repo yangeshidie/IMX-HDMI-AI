@@ -860,7 +860,7 @@ int frame_queue_abort(FrameQueue *queue)
 
 #define DEV_CAMERA                  "/dev/video11"
 #define DEV_DRM                     "/dev/dri/card0"
-#define VERSION                     "1.0：修改生命周期管理方式\n"
+#define VERSION                     "1.1：MPP对齐官方\n"
 
 #define CAM_WIDTH                   3840
 #define CAM_HEIGHT                  2160
@@ -1086,6 +1086,7 @@ int main()
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint32_t fps)
 {
@@ -1093,8 +1094,7 @@ int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint3
     ctx->width = width;
     ctx->height = height;
     ctx->fps = fps;
-    // 4K H.264 推荐码率，例如 10~20Mbps。这里设为 10Mbps
-    ctx->bps = 10 * 1024 * 1024; 
+    ctx->bps = 10 * 1024 * 1024; // 10Mbps
 
     ctx->hor_stride = MPP_ALIGN(width, 16);
     ctx->ver_stride = MPP_ALIGN(height, 16);
@@ -1105,51 +1105,62 @@ int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint3
         return -1;
     }
 
-    // 2. 初始化为 H.264 编码器
+    // 2. 设置输出为阻塞模式 (重要！省去繁琐的 sleep 重试)
+    MppPollType timeout = MPP_POLL_BLOCK;
+    if (ctx->mpi->control(ctx->ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout) != MPP_OK) {
+        fprintf(stderr, "Failed to set output timeout\n");
+        return -1;
+    }
+
+    // 3. 初始化为 H.264 编码器
     if (mpp_init(ctx->ctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC) != MPP_OK) {
         fprintf(stderr, "mpp_init failed\n");
         return -1;
     }
 
-    // 3. 配置编码器参数
+    // 4. 配置编码器参数
     MppEncCfg cfg;
     mpp_enc_cfg_init(&cfg);
     
-    // 设置分辨率和格式 (假设输入严格为 NV12，对应 MPP_FMT_YUV420SP)
     mpp_enc_cfg_set_s32(cfg, "prep:width", width);
     mpp_enc_cfg_set_s32(cfg, "prep:height", height);
-
     mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", ctx->hor_stride);
     mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", ctx->ver_stride);
     mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
 
-    // 设置码率控制 (CBR - 恒定码率)
+    // 设置码率控制 (CBR)
     mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
     mpp_enc_cfg_set_s32(cfg, "rc:bps_target", ctx->bps);
     mpp_enc_cfg_set_s32(cfg, "rc:bps_max", ctx->bps * 1.2);
     mpp_enc_cfg_set_s32(cfg, "rc:bps_min", ctx->bps * 0.8);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denom", 1);    
     mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm", 1);
-    mpp_enc_cfg_set_s32(cfg, "rc:gop", fps * 2); // 2秒一个I帧
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denom", 1);   
+    mpp_enc_cfg_set_s32(cfg, "rc:gop", fps * 2);
 
-    ctx->mpi->control(ctx->ctx, MPP_ENC_SET_CFG, cfg);
+    if (ctx->mpi->control(ctx->ctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) {
+        fprintf(stderr, "MPP_ENC_SET_CFG failed\n");
+    }
     mpp_enc_cfg_deinit(cfg);
 
-    // 4. 获取 SPS/PPS 头 (H.264 解码必备)
+    // 5. 获取 SPS/PPS 头
     MppPacket packet = NULL;
-    ctx->mpi->control(ctx->ctx, MPP_ENC_GET_EXTRA_INFO, &packet);
-    if (packet) {
+    // 必须自己提供一块 buffer 给 MPP 写入头部信息，头部信息一般不超过 1024 字节
+    char hdr_buf[1024]; 
+    mpp_packet_init(&packet, hdr_buf, sizeof(hdr_buf));
+    mpp_packet_set_length(packet, 0); // 重要：必须清零长度
+
+    if (ctx->mpi->control(ctx->ctx, MPP_ENC_GET_HDR_SYNC, packet) == MPP_OK) {
         ctx->header_size = mpp_packet_get_length(packet);
         ctx->header_data = malloc(ctx->header_size);
         memcpy(ctx->header_data, mpp_packet_get_pos(packet), ctx->header_size);
-        // header_data 需要在推流或写入文件时放在最开头
-        mpp_packet_deinit(&packet);
+    } else {
+        fprintf(stderr, "Failed to get SPS/PPS header\n");
     }
+    mpp_packet_deinit(&packet);
 
-    // 5. 创建用于导入 DMA FD 的 Buffer Group
     mpp_buffer_group_get_internal(&ctx->buf_grp, MPP_BUFFER_TYPE_EXT_DMA);
 
     return 0;
@@ -1157,7 +1168,7 @@ int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint3
 
 int mpp_encoder_encode(EncoderContext *ctx, const Frame *in_frame, EncodedPacket *out_packet)
 {
-    if (!ctx || !out_packet) return -1;
+    if (!ctx || !out_packet || !in_frame) return -1;
 
     MppBuffer mpp_buf = NULL;
     MppFrame mpp_frame = NULL;
@@ -1168,12 +1179,30 @@ int mpp_encoder_encode(EncoderContext *ctx, const Frame *in_frame, EncodedPacket
     memset(&info, 0, sizeof(info));
     info.type = MPP_BUFFER_TYPE_EXT_DMA;
     info.fd = in_frame->dma_fd;
-
     info.size = ctx->hor_stride * ctx->ver_stride * 3 / 2; 
     info.index = in_frame->index;
 
-    // import_with_tag 实现了零拷贝，MPP 底层直接操作摄像头的物理内存
-    mpp_buffer_import_with_tag(ctx->buf_grp, &info, &mpp_buf, "camera_in", __func__);
+    // if (mpp_buffer_import_with_tag(ctx->buf_grp, &info, &mpp_buf, "camera_in", __func__) != MPP_OK) {
+    //     fprintf(stderr, "Failed to import DMA fd\n");
+    //     return -1;
+    // }
+
+        info.size = in_frame->width * in_frame->height * 3 / 2; 
+    
+    info.index = in_frame->index;
+
+    // 打印调试信息，这非常关键！
+    // printf("-> Trying to import DMA fd: %d, size: %zu, index: %d\n", info.fd, info.size, info.index);
+
+    if (info.fd <= 0) {
+        fprintf(stderr, "Error: Invalid DMA FD (%d)! Check your V4L2 export buffer logic.\n", info.fd);
+        return -1;
+    }
+
+    if (mpp_buffer_import_with_tag(ctx->buf_grp, &info, &mpp_buf, "camera_in", __func__) != MPP_OK) {
+        fprintf(stderr, "Failed to import DMA fd! fd: %d, req_size: %zu, index: %d\n", info.fd, info.size, info.index);
+        return -1;
+    }
 
     // 2. 初始化并设置 MppFrame
     mpp_frame_init(&mpp_frame);
@@ -1193,23 +1222,13 @@ int mpp_encoder_encode(EncoderContext *ctx, const Frame *in_frame, EncodedPacket
         return -1;
     }
 
-    // 清理送入帧的结构 (MPP 内部已持有引用)
+    // 清理送入帧的结构 (MPP 底层已经增加了引用计数，这里必须释放表层结构)
     mpp_frame_deinit(&mpp_frame);
     if (mpp_buf) mpp_buffer_put(mpp_buf);
 
-    // 4. 获取编码后的码流
-    int retry_count = 0;
-    const int max_retries = 100; // 最长等待约 200ms
-    do {
-        if (ctx->mpi->encode_get_packet(ctx->ctx, &mpp_packet) == MPP_OK && mpp_packet != NULL) {
-            break; // 成功获取到包
-        }
-        usleep(2000); // 等待 2ms 再试
-        retry_count++;
-    } while (retry_count < max_retries);
-
-    if (mpp_packet == NULL) {
-        fprintf(stderr, "MPP get packet timeout\n");
+    // 4. 获取编码后的码流 (因为初始化设置了 BLOCK，这里只需调一次，无需死循环)
+    if (ctx->mpi->encode_get_packet(ctx->ctx, &mpp_packet) != MPP_OK || mpp_packet == NULL) {
+        fprintf(stderr, "MPP get packet failed\n");
         return -1;
     }
 
@@ -1227,11 +1246,11 @@ int mpp_encoder_encode(EncoderContext *ctx, const Frame *in_frame, EncodedPacket
 
     return 0;
 }
-// 处理完 EncodedPacket 后调用
+
 void mpp_encoder_release_packet(EncodedPacket *packet)
 {
     if (packet && packet->packet) {
-        mpp_packet_deinit(&packet->packet);
+        mpp_packet_deinit((MppPacket*)&packet->packet);
         packet->packet = NULL;
     }
 }
@@ -1239,7 +1258,6 @@ void mpp_encoder_release_packet(EncodedPacket *packet)
 int mpp_encoder_deinit(EncoderContext *ctx)
 {
     if (!ctx) return 0;
-
     if (ctx->mpi) {
         ctx->mpi->reset(ctx->ctx);
         mpp_destroy(ctx->ctx);
@@ -1256,7 +1274,6 @@ int mpp_encoder_deinit(EncoderContext *ctx)
         free(ctx->header_data);
         ctx->header_data = NULL;
     }
-
     return 0;
 }  ]]></mpp_encoder.c>
   <rga_process.c><![CDATA[

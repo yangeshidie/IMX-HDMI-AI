@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdatomic.h> 
+#include <unistd.h>
 
 #define         THREAD_OFF          (0)
 #define         THREAD_ON           (1)
@@ -18,6 +19,7 @@
 typedef struct {
     int dma_fd;             //该帧图像的fd
     int width;              //图像宽度          
+    size_t size;            //该帧图像真实的物理内存大小
     int height;             //高度
     int format;             //格式
     int index;              //摄像头buffer的索引，用于归还

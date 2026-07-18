@@ -51,9 +51,9 @@ int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint3
     mpp_enc_cfg_set_s32(cfg, "rc:bps_min", ctx->bps * 0.8);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denom", 1);    // 修改了拼写错误 denorm -> denom
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denom", 1);    
     mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denom", 1);   // 修改了拼写错误 denorm -> denom
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denom", 1);   
     mpp_enc_cfg_set_s32(cfg, "rc:gop", fps * 2);
 
     if (ctx->mpi->control(ctx->ctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) {
@@ -61,7 +61,7 @@ int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint3
     }
     mpp_enc_cfg_deinit(cfg);
 
-    // 5. 获取 SPS/PPS 头 (使用官方最新的 GET_HDR_SYNC 方式)
+    // 5. 获取 SPS/PPS 头
     MppPacket packet = NULL;
     // 必须自己提供一块 buffer 给 MPP 写入头部信息，头部信息一般不超过 1024 字节
     char hdr_buf[1024]; 
@@ -77,8 +77,7 @@ int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint3
     }
     mpp_packet_deinit(&packet);
 
-    // 6. 创建用于导入 DMA FD 的 Buffer Group
-    mpp_buffer_group_get_internal(&ctx->buf_grp, MPP_BUFFER_TYPE_EXT_DMA);
+    mpp_buffer_group_get_external(&ctx->buf_grp, MPP_BUFFER_TYPE_DRM);
 
     return 0;
 }
@@ -94,13 +93,19 @@ int mpp_encoder_encode(EncoderContext *ctx, const Frame *in_frame, EncodedPacket
     // 1. 将 DMA FD 导入为 MppBuffer
     MppBufferInfo info;
     memset(&info, 0, sizeof(info));
-    info.type = MPP_BUFFER_TYPE_EXT_DMA;
+    info.type = MPP_BUFFER_TYPE_DRM; 
     info.fd = in_frame->dma_fd;
-    info.size = ctx->hor_stride * ctx->ver_stride * 3 / 2; 
+    info.size = in_frame->size;      
     info.index = in_frame->index;
 
+    if (info.fd <= 0) {
+        fprintf(stderr, "Error: Invalid DMA FD (%d)! Check your V4L2 export buffer logic.\n", info.fd);
+        return -1;
+    }
+
     if (mpp_buffer_import_with_tag(ctx->buf_grp, &info, &mpp_buf, "camera_in", __func__) != MPP_OK) {
-        fprintf(stderr, "Failed to import DMA fd\n");
+        fprintf(stderr, "Failed to import DMA fd! fd: %d, req_size: %zu, index: %d\n", 
+                info.fd, info.size, info.index);
         return -1;
     }
 
