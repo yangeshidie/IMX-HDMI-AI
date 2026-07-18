@@ -23,7 +23,7 @@ typedef struct {
     int index;              //摄像头buffer的索引，用于归还
     uint64_t timestamp;     //时间戳
 
-    atomic_int ref_count;   //引用计数
+    //atomic_int ref_count;   //引用计数
     void *camera_ctx;       //摄像头上下文，用于归还
 } Frame;
 

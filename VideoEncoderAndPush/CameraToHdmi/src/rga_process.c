@@ -2,8 +2,7 @@
 
 int rga_process_init()
 {
-    c_RkRgaInit();
-    return 0;
+    return c_RkRgaInit();
 }
 
 int rga_process_convert_scale(const Frame *src_frame, const Frame *dst_frame)
@@ -28,4 +27,9 @@ int rga_process_convert_scale(const Frame *src_frame, const Frame *dst_frame)
         return -1;
     }
     return 0;
+}
+
+void rga_process_deinit()
+{
+    c_RkRgaDeInit();
 }

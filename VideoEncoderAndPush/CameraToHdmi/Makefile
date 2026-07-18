@@ -5,7 +5,6 @@ CC = aarch64-linux-gnu-gcc
 INC_DIR = ./include
 SRC_DIR = ./src
 
-# 核心：加入 -I$(INC_DIR) 解决 VS Code 波浪线和头文件找不到的问题
 SYSROOT = /home/yanmobile/my_software/RKSDK/TaishanPi-3-Linux/debian/binary
 
 CFLAGS = -I$(INC_DIR) -Wall -O2 -g -pthread
@@ -17,14 +16,14 @@ CFLAGS += -I$(SYSROOT)/usr/include/drm
 LDFLAGS = --sysroot=$(SYSROOT)
 LDFLAGS += -L$(SYSROOT)/usr/lib/aarch64-linux-gnu
 
-LIBS = -ldrm -lrga
+LIBS = -ldrm -lrga -lrockchip_mpp
 
 # 2. 目标文件定义（最终只输出一个 TEST）
 TARGET = TEST
 ALL_TARGETS = $(TARGET)
 
 # 3. 远程部署路径
-REMOTE_PATH_SUB = MultiThread
+REMOTE_PATH_SUB = encoderAndPush
 REMOTE_PATH1 = $(REMOTE_PATH)/$(REMOTE_PATH_SUB)
 
 # 4. 源文件列表（把 src 目录下的所有核心文件都包进来）
@@ -32,7 +31,8 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/camera.c \
        $(SRC_DIR)/display.c \
        $(SRC_DIR)/rga_process.c \
-       $(SRC_DIR)/frame_queue.c
+       $(SRC_DIR)/frame_queue.c \
+	   $(SRC_DIR)/mpp_encoder.c
 
 # 5. 伪目标声明
 .PHONY: all clean deploy run

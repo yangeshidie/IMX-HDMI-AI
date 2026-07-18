@@ -21,6 +21,7 @@ typedef struct {
     size_t length;       // 缓冲区大小
     int dma_fd;          // 导出的 DMA FD (供给 RGA 使用)
     bool is_queued;      // 状态标记：当前是否已入队交给了底层驱动
+    atomic_int ref_count;// 生命周期管理
 } CameraBuffer;
 
 // 摄像头上下文 (对外视为不透明对象)

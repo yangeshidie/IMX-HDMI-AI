@@ -1,0 +1,1298 @@
+<head>
+  <camera.h><![CDATA[
+#ifndef _CAMERA_H_
+#define _CAMERA_H_
+#define _GNU_SOURCE 
+
+#include <stdlib.h>  
+#include <unistd.h>  
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <linux/videodev2.h>
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include "common.h"
+
+// 内部管理的单个摄像头缓冲区结构
+typedef struct {
+    void *start;         // mmap 的用户空间虚拟地址 (用于释放)
+    size_t length;       // 缓冲区大小
+    int dma_fd;          // 导出的 DMA FD (供给 RGA 使用)
+    bool is_queued;      // 状态标记：当前是否已入队交给了底层驱动
+    atomic_int ref_count;// 生命周期管理
+} CameraBuffer;
+
+// 摄像头上下文 (对外视为不透明对象)
+typedef struct CameraContext {
+    // 1. 设备基础信息
+    int fd;                 // /dev/videoX 的文件描述符
+    char dev_name[64];      // 设备节点名称，方便报错打印
+
+    // 2. 格式与配置参数
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_format;  // 如 V4L2_PIX_FMT_NV12
+    uint32_t buf_type;      // 如 V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+
+    // 3. 缓冲池管理
+    uint32_t buffer_count;  // 申请的 Buffer 数量 (例如 4)
+    CameraBuffer *buffers;  // 动态分配的 Buffer 数组
+
+    // 4. 运行状态
+    bool is_initialized;    // 是否已完成初始化
+    bool is_streaming;      // 是否已经 STREAMON
+
+    // pthread_mutex_t lock; // 如果允许多线程同时调用 camera 的 API，则需要锁
+
+} CameraContext;
+
+int camera_init(CameraContext *ctx, const char *dev_name, uint32_t w, uint32_t h, uint32_t count, uint32_t pixel_format, uint32_t buf_type);
+int camera_start(CameraContext *ctx);
+int camera_get_frame(CameraContext *ctx, Frame *frame);
+int camera_put_frame(CameraContext *ctx, const Frame *frame); // 归还 Buffer
+int camera_stop(CameraContext *ctx);
+int camera_deinit(CameraContext *ctx);
+
+#endif // _CAMERA_H_  ]]></camera.h>
+  <common.h><![CDATA[
+#ifndef _COMMON_H_
+#define _COMMON_H_
+
+#include <stdint.h>
+#include <stdatomic.h> 
+
+#define         THREAD_OFF          (0)
+#define         THREAD_ON           (1)
+
+#define         THREAD_DISPLAY      THREAD_ON
+#define         THREAD_ENCODER      THREAD_ON
+#define         THREAD_AI           THREAD_OFF
+
+#define         ACTIVE_THREAD_COUNT             (THREAD_DISPLAY + THREAD_ENCODER + THREAD_AI)
+
+
+
+typedef struct {
+    int dma_fd;             //该帧图像的fd
+    int width;              //图像宽度          
+    int height;             //高度
+    int format;             //格式
+    int index;              //摄像头buffer的索引，用于归还
+    uint64_t timestamp;     //时间戳
+
+    //atomic_int ref_count;   //引用计数
+    void *camera_ctx;       //摄像头上下文，用于归还
+} Frame;
+
+void frame_retain(Frame *frame);
+void frame_release(Frame *frame);
+
+#endif // _COMMON_H_  ]]></common.h>
+  <display.h><![CDATA[
+#ifndef _DISPLAY_H_
+#define _DISPLAY_H_
+
+#define _GNU_SOURCE 
+
+#include <stdio.h>
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include "common.h"
+
+#define DRM_BUFFER_COUNT    2 
+#define DRM_BPP             32
+// 内部管理的单个 DRM Dumb Buffer 结构
+typedef struct {
+    uint32_t handle;     // DRM handle (内部对象句柄)
+    uint32_t fb_id;      // Framebuffer ID (供 DRM 设置显示使用)
+    uint32_t pitch;      // 步长 (一行像素占用的字节数)
+    uint64_t size;       // 显存总大小
+    int dma_fd;          // 导出的 DMA FD (供 RGA 写入目标)
+    void *vaddr;         // 映射到用户空间的地址 (备用/调试用)
+} DrmBuffer;
+
+// 显示上下文 (对外视为不透明对象)
+typedef struct DisplayContext {
+    // 1. 设备基础信息
+    int fd;
+    char dev_name[64];      // 如 "/dev/dri/card0"
+
+    // 2. 屏幕与输出格式
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;           // 位深 (如 32)
+    uint32_t pixel_format;  // DRM_FORMAT_XRGB8888 或 RK_FORMAT_BGRA_8888
+
+    // 3. DRM 核心对象 ID
+    uint32_t crtc_id;
+    uint32_t connector_id;
+    drmModeModeInfo mode;
+    drmModeCrtc *saved_crtc; // 保存启动前的屏幕状态，用于程序退出时完美恢复
+
+    // 4. 双缓冲管理 (Ping-Pong)
+    DrmBuffer buffers[DRM_BUFFER_COUNT];
+    int front_buf_idx;       // 当前正在屏幕上显示的 Buffer 索引
+    int back_buf_idx;        // 当前可供 RGA 绘制的后台 Buffer 索引
+
+    // 5. 运行状态
+    bool is_initialized;
+
+} DisplayContext;
+
+
+int display_init(DisplayContext *ctx, const char *dev_name);
+// 获取后台 Buffer 的 Frame 信息，以便传给 RGA
+int display_get_back_frame(DisplayContext *ctx, Frame *drm_frame);
+// 执行 Page Flip (翻页)，将刚刚 RGA 渲染完的后台 Buffer 切换到前台显示
+int display_show(DisplayContext *ctx); 
+int display_deinit(DisplayContext *ctx);
+
+#endif // _DISPLAY_H_  ]]></display.h>
+  <frame_queue.h><![CDATA[
+#ifndef _FRAME_QUEUE_H_
+#define _FRAME_QUEUE_H_
+
+#include "common.h"
+#include <pthread.h>
+#include <stdbool.h>
+
+typedef struct {
+    Frame *frames;       // 动态数组，根据 capacity 分配
+    int capacity;        // 队列最大容量
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t empty; // 仅保留 empty，供消费者死等
+    bool abort;
+} FrameQueue;
+
+// 增加 capacity 参数
+int frame_queue_init(FrameQueue *queue, int capacity);
+int frame_queue_push(FrameQueue *queue, const Frame *frame);
+int frame_queue_pop(FrameQueue *queue, Frame *frame);
+int frame_queue_deinit(FrameQueue *queue);
+int frame_queue_abort(FrameQueue *queue);
+
+#endif // _FRAME_QUEUE_H_  ]]></frame_queue.h>
+  <mpp_encoder.h><![CDATA[
+#ifndef _MPP_ENCODER_H_
+#define _MPP_ENCODER_H_
+
+#ifndef MPP_ALIGN
+#define MPP_ALIGN(x, a)         (((x)+(a)-1)&~((a)-1))
+#endif
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <rockchip/rk_mpi.h>
+#include <rockchip/mpp_buffer.h>
+#include <rockchip/mpp_packet.h> 
+#include <rockchip/mpp_frame.h>
+#include <rockchip/mpp_err.h>
+#include <unistd.h>
+
+#include "common.h" 
+
+#ifndef MPP_PACKET_FLAG_INTRA
+#define MPP_PACKET_FLAG_INTRA  (0x00000008)
+#endif
+
+// 编码输出的 H.264 数据包
+typedef struct {
+    uint8_t *data;      // 数据指针 (MPP 内部管理的内存)
+    size_t length;      // 数据长度
+    bool is_keyframe;   // 是否为 I 帧
+    uint64_t pts;       // 时间戳
+    MppPacket packet;   // 原始的 MPP packet，处理完后需要释放
+} EncodedPacket;
+
+// MPP 编码器上下文
+typedef struct {
+    MppCtx ctx;
+    MppApi *mpi;
+    MppBufferGroup buf_grp;
+    
+    uint32_t width;
+    uint32_t height;
+    uint32_t fps;
+    uint32_t bps; // 比特率
+
+    // 保存 SPS/PPS 头部数据 (H.264 需要放在最前面)
+    uint8_t *header_data;
+    size_t header_size;
+    uint32_t hor_stride;
+    uint32_t ver_stride;
+} EncoderContext;
+
+int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint32_t fps);
+int mpp_encoder_encode(EncoderContext *ctx, const Frame *in_frame, EncodedPacket *out_packet);
+void mpp_encoder_release_packet(EncodedPacket *packet);
+int mpp_encoder_deinit(EncoderContext *ctx);
+
+#endif // _MPP_ENCODER_H_  ]]></mpp_encoder.h>
+  <rga_process.h><![CDATA[
+#ifndef _RGA_PROCESS_H_
+#define _RGA_PROCESS_H_
+
+#include "common.h"
+#include <rga/RgaApi.h>
+#include <rga/rga.h>
+
+
+// src_frame 来自 Camera，dst_frame 来自 DRM
+int rga_process_init();
+int rga_process_convert_scale(const Frame *src_frame, const Frame *dst_frame);
+void rga_process_deinit();
+
+#endif  ]]></rga_process.h>
+</head>
+
+<src>
+  <camera.c><![CDATA[
+#include "../include/camera.h"
+
+
+int camera_init(CameraContext *ctx, const char *dev_name, uint32_t w, uint32_t h, 
+                uint32_t count, uint32_t pixel_format, uint32_t buf_type)
+{
+    memset(ctx, 0, sizeof(CameraContext));
+    strncpy(ctx->dev_name, dev_name, sizeof(ctx->dev_name) - 1);
+
+    ctx->fd = open(dev_name, O_RDWR | O_CLOEXEC);
+    if (ctx->fd < 0) {
+        perror("摄像头打开失败");
+        return -1;
+    }
+
+    ctx->width = w;
+    ctx->height = h;
+    ctx->buffer_count = count;
+    ctx->buf_type = buf_type;
+    ctx->pixel_format = pixel_format;
+
+    // 1. 设置格式
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = ctx->buf_type;
+    fmt.fmt.pix_mp.width = ctx->width;
+    fmt.fmt.pix_mp.height = ctx->height;
+    fmt.fmt.pix_mp.pixelformat = ctx->pixel_format;
+    fmt.fmt.pix_mp.field = V4L2_FIELD_NONE; 
+    fmt.fmt.pix_mp.num_planes = 1;
+
+    if (ioctl(ctx->fd, VIDIOC_S_FMT, &fmt) < 0) {
+        perror("V4L2 格式设置失败");
+        return -1;
+    }
+
+    // 2. 申请缓冲区
+    struct v4l2_requestbuffers rqp = {0};
+    rqp.count = ctx->buffer_count;
+    rqp.type = ctx->buf_type;
+    rqp.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(ctx->fd, VIDIOC_REQBUFS, &rqp) < 0) {
+        perror("V4L2 申请缓冲区失败");
+        return -1;
+    }
+
+    if (rqp.count == 0) {
+        fprintf(stderr, "V4L2 分配了 0 个 Buffer\n");
+        return -1;
+    }
+    ctx->buffer_count = rqp.count; 
+
+    ctx->buffers = calloc(ctx->buffer_count, sizeof(CameraBuffer));
+    if (!ctx->buffers) {
+        perror("分配内存失败");
+        return -1;
+    }
+
+    // 3. 映射与导出 FD
+    for (uint32_t i = 0; i < ctx->buffer_count; i++) {
+        struct v4l2_buffer buf = {0};
+        struct v4l2_plane planes[1] = {0};
+        buf.type = ctx->buf_type;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        buf.length = 1;
+        buf.m.planes = planes;
+
+        if (ioctl(ctx->fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            perror("VIDIOC_QUERYBUF 失败");
+            break;
+        }
+
+        ctx->buffers[i].length = planes[0].length;
+        ctx->buffers[i].start = mmap(NULL, planes[0].length, PROT_READ | PROT_WRITE, 
+                                     MAP_SHARED, ctx->fd, planes[0].m.mem_offset);
+        
+        if (ctx->buffers[i].start == MAP_FAILED) {
+            perror("mmap 失败");
+            return -1; 
+        }
+        
+        // 导出 DMA FD
+        struct v4l2_exportbuffer expbuf = {0};
+        expbuf.type = ctx->buf_type;
+        expbuf.index = i;
+        if (ioctl(ctx->fd, VIDIOC_EXPBUF, &expbuf) == 0) {
+            ctx->buffers[i].dma_fd = expbuf.fd;
+        } else {
+            perror("VIDIOC_EXPBUF 失败");
+            return -1;
+        }
+        
+        // 预入队空缓冲区
+        if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) == 0) {
+            ctx->buffers[i].is_queued = true; 
+        } else {
+            perror("初始 QBUF 失败");
+            return -1;
+        }
+    }
+
+    ctx->is_initialized = true;
+    return 0;
+}
+
+int camera_start(CameraContext *ctx)
+{
+    if (!ctx || ctx->fd < 0) return -1;
+    if (ioctl(ctx->fd, VIDIOC_STREAMON, &ctx->buf_type) < 0) {
+        perror("开启视频流失败");
+        return -1;
+    }
+    ctx->is_streaming = true;
+    return 0;
+}
+
+int camera_get_frame(CameraContext *ctx, Frame *frame)
+{
+    if (!ctx || ctx->fd < 0 || frame == NULL) return -1;
+
+    struct v4l2_buffer vBuf = {0};
+    struct v4l2_plane planes[1] = {0};
+
+    vBuf.type = ctx->buf_type;
+    vBuf.memory = V4L2_MEMORY_MMAP;
+    vBuf.length = 1;
+    vBuf.m.planes = planes;
+
+    if (ioctl(ctx->fd, VIDIOC_DQBUF, &vBuf) < 0) {
+        perror("VIDIOC_DQBUF 出队失败");
+        return -1;
+    }
+
+    if (vBuf.index >= ctx->buffer_count) {
+        fprintf(stderr, "获取到的 Buffer index 超出范围!\n");
+        return -1;
+    }
+
+    ctx->buffers[vBuf.index].is_queued = false;
+
+    frame->dma_fd    = ctx->buffers[vBuf.index].dma_fd;
+    frame->timestamp = (uint64_t)vBuf.timestamp.tv_sec * 1000000 + vBuf.timestamp.tv_usec;
+    frame->index     = vBuf.index;
+    frame->width     = ctx->width;
+    frame->height    = ctx->height;
+    frame->format    = ctx->pixel_format; 
+
+    frame->camera_ctx = ctx; // 记录是从哪个摄像头出来的，为了以后归还
+    atomic_init(&ctx->buffers[vBuf.index].ref_count, 1); // 刚取出来时，默认引用计数为 1
+
+    return 0; 
+}
+
+int camera_put_frame(CameraContext *ctx, const Frame *frame) 
+{
+    if (!ctx || ctx->fd < 0 || frame == NULL) return -1;
+
+    if (frame->index >= ctx->buffer_count) return -1;
+    if (ctx->buffers[frame->index].is_queued) {
+        return 0; 
+    }
+
+    struct v4l2_buffer buf = {0};
+    struct v4l2_plane planes[1] = {0};
+    buf.type = ctx->buf_type;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = frame->index;
+    buf.length = 1;
+    buf.m.planes = planes;
+
+    if (ioctl(ctx->fd, VIDIOC_QBUF, &buf) < 0) {
+        perror("VIDIOC_QBUF 归还 Buffer 失败");
+        return -1;
+    }
+
+    ctx->buffers[frame->index].is_queued = true;
+    return 0;
+}
+int camera_stop(CameraContext *ctx)
+{
+    if (!ctx || ctx->fd < 0) return -1;
+    if(ioctl(ctx->fd, VIDIOC_STREAMOFF, &ctx->buf_type) < 0)
+    {
+        perror("关闭视频流失败");
+        return -1;
+    }
+    ctx->is_streaming = false;
+    return 0;
+}
+
+int camera_deinit(CameraContext *ctx)
+{
+    if (!ctx || !ctx->is_initialized) return 0; // 防御性检查，支持重复调用
+
+    if (ctx->fd > 0) {
+        enum v4l2_buf_type type = ctx->buf_type;
+        ioctl(ctx->fd, VIDIOC_STREAMOFF, &type);
+    }
+
+    if (ctx->buffers) {
+        for (uint32_t i = 0; i < ctx->buffer_count; i++) {
+            CameraBuffer *buf = &ctx->buffers[i];
+            
+            // 解除 mmap
+            if (buf->start && buf->start != MAP_FAILED) {
+                munmap(buf->start, buf->length);
+                buf->start = NULL;
+            }
+            // 关闭 DMA FD
+            if (buf->dma_fd > 0) {
+                close(buf->dma_fd);
+                buf->dma_fd = -1;
+            }
+        }
+        // 释放动态分配的结构体数组
+        free(ctx->buffers);
+        ctx->buffers = NULL;
+    }
+
+    if (ctx->fd > 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+
+    ctx->is_initialized = false;
+    return 0;
+}
+
+
+void frame_retain(Frame *frame)
+{
+    if (!frame || !frame->camera_ctx) return;
+    CameraContext *ctx = (CameraContext *)frame->camera_ctx;
+    atomic_fetch_add(&ctx->buffers[frame->index].ref_count, 1);
+}
+
+void frame_release(Frame *frame)
+{
+    if (!frame || !frame->camera_ctx) return;
+    CameraContext *ctx = (CameraContext *)frame->camera_ctx;
+    if (atomic_fetch_sub(&ctx->buffers[frame->index].ref_count, 1) == 1) {
+        camera_put_frame(ctx, frame);
+    }
+}  ]]></camera.c>
+  <display.c><![CDATA[
+#include "../include/display.h"
+
+int display_init(DisplayContext *ctx, const char *dev_name)
+{
+    drmModeRes *res = NULL;
+    drmModeConnector *conn = NULL;
+    drmModeEncoder *enc = NULL;
+
+    memset(ctx, 0, sizeof(DisplayContext));
+    strncpy(ctx->dev_name, dev_name, sizeof(ctx->dev_name) - 1);
+
+    ctx->fd = open(dev_name, O_RDWR | O_CLOEXEC);
+    if (ctx->fd < 0) {
+        perror("DRM 设备打开失败");
+        return -1;
+    }
+
+    res = drmModeGetResources(ctx->fd);
+    if (!res) {
+        fprintf(stderr, "无法获取 DRM 资源\n");
+        goto err_fd; // 跳转清理
+    }
+
+    for (int i = 0; i < res->count_connectors; i++) {
+        conn = drmModeGetConnector(ctx->fd, res->connectors[i]);
+        if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+            break;
+        }
+        drmModeFreeConnector(conn);
+        conn = NULL;
+    }
+
+    if (!conn) {
+        fprintf(stderr, "未找到已连接的显示器\n");
+        goto err_res;
+    }
+
+    ctx->connector_id = conn->connector_id;
+    ctx->mode = conn->modes[0];
+    ctx->width = ctx->mode.hdisplay;
+    ctx->height = ctx->mode.vdisplay;
+    ctx->bpp = 32; 
+
+    enc = drmModeGetEncoder(ctx->fd, conn->encoder_id);
+    if (!enc) {
+        fprintf(stderr, "获取 Encoder 失败\n");
+        goto err_conn;
+    }
+    
+    ctx->crtc_id = enc->crtc_id;
+    ctx->saved_crtc = drmModeGetCrtc(ctx->fd, ctx->crtc_id);
+    drmModeFreeEncoder(enc);
+
+    // === 核心：创建双缓冲 ===
+    for (int i = 0; i < DRM_BUFFER_COUNT; i++) {
+        DrmBuffer *buf = &ctx->buffers[i];
+
+        struct drm_mode_create_dumb creq = {0};
+        creq.width = ctx->width;
+        creq.height = ctx->height;
+        creq.bpp = ctx->bpp;
+        if (ioctl(ctx->fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) {
+            perror("创建 DRM Dumb Buffer 失败");
+            goto err_bufs; // 跳转清理已创建的 buffers
+        }
+        
+        buf->handle = creq.handle;
+        buf->pitch = creq.pitch;
+        buf->size = creq.size;
+
+        if (drmModeAddFB(ctx->fd, ctx->width, ctx->height, 24, ctx->bpp, 
+                         buf->pitch, buf->handle, &buf->fb_id) < 0) {
+            perror("drmModeAddFB 失败");
+            goto err_bufs;
+        }
+
+        // 优化：建议加上 DRM_CLOEXEC 标志（宏值通常为 O_CLOEXEC 或直接写 O_CLOEXEC）
+        if (drmPrimeHandleToFD(ctx->fd, buf->handle, O_CLOEXEC, &buf->dma_fd) < 0) {
+            perror("DRM Buffer 导出 DMA FD 失败");
+            goto err_bufs;
+        }
+
+        struct drm_mode_map_dumb mreq = {0};
+        mreq.handle = buf->handle;
+        if (ioctl(ctx->fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) == 0) {
+            buf->vaddr = mmap(0, buf->size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->fd, mreq.offset);
+            if (buf->vaddr != MAP_FAILED) {
+                memset(buf->vaddr, 0, buf->size); // 填 0 即为黑色
+            } else {
+                buf->vaddr = NULL; // 防止后续清理时 munmap(MAP_FAILED)
+            }
+        }
+    }
+
+    if (drmModeSetCrtc(ctx->fd, ctx->crtc_id, ctx->buffers[0].fb_id, 0, 0, 
+                       &ctx->connector_id, 1, &ctx->mode) < 0) {
+        perror("drmModeSetCrtc 失败");
+        goto err_bufs;
+    }
+
+    ctx->front_buf_idx = 0; 
+    ctx->back_buf_idx = 1;  
+
+    drmModeFreeConnector(conn);
+    drmModeFreeResources(res);
+
+    ctx->is_initialized = true;
+    printf("DRM 显示初始化成功: %dx%d (双缓冲就绪)\n", ctx->width, ctx->height);
+
+    return 0;
+
+err_bufs:
+    for (int i = 0; i < DRM_BUFFER_COUNT; i++) {
+        DrmBuffer *buf = &ctx->buffers[i];
+        if (buf->vaddr) munmap(buf->vaddr, buf->size);
+        if (buf->dma_fd > 0) close(buf->dma_fd);
+        if (buf->fb_id) drmModeRmFB(ctx->fd, buf->fb_id);
+        if (buf->handle) {
+            struct drm_mode_destroy_dumb dreq = { .handle = buf->handle };
+            ioctl(ctx->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+        }
+    }
+    if (ctx->saved_crtc) drmModeFreeCrtc(ctx->saved_crtc);
+err_conn:
+    drmModeFreeConnector(conn);
+err_res:
+    drmModeFreeResources(res);
+err_fd:
+    close(ctx->fd);
+    return -1;
+}
+// 获取后台 Buffer 的 Frame 信息，以便传给 RGA
+int display_get_back_frame(DisplayContext *ctx, Frame *drm_frame)
+{
+    if (!ctx || ctx->fd < 0 || drm_frame == NULL) return -1;
+
+    drm_frame->dma_fd = ctx->buffers[ctx->back_buf_idx].dma_fd; 
+    drm_frame->format = ctx->pixel_format;
+    drm_frame->height = ctx->height;
+    drm_frame->width  = ctx->width;
+    drm_frame->index  = ctx->back_buf_idx; 
+    
+    return 0;
+}
+
+int display_show(DisplayContext *ctx)
+{
+    if (!ctx || ctx->fd < 0) return -1;
+    uint32_t back_fb_id = ctx->buffers[ctx->back_buf_idx].fb_id;
+
+    if (drmModePageFlip(ctx->fd, ctx->crtc_id, back_fb_id, 0, NULL) < 0) {
+        if (drmModeSetCrtc(ctx->fd, ctx->crtc_id, back_fb_id, 0, 0, 
+                           &ctx->connector_id, 1, &ctx->mode) < 0) {
+            perror("DRM 切换画面失败");
+            return -1;
+        }
+    }
+    int temp = ctx->front_buf_idx;
+    ctx->front_buf_idx = ctx->back_buf_idx;
+    ctx->back_buf_idx = temp;
+    return 0;
+}
+int display_deinit(DisplayContext *ctx)
+{
+    if (!ctx || !ctx->is_initialized) return 0;
+
+    if (ctx->saved_crtc) {
+        drmModeSetCrtc(ctx->fd, 
+                       ctx->saved_crtc->crtc_id, 
+                       ctx->saved_crtc->buffer_id,
+                       ctx->saved_crtc->x, 
+                       ctx->saved_crtc->y, 
+                       &ctx->connector_id, 
+                       1, 
+                       &ctx->saved_crtc->mode);
+                       
+        drmModeFreeCrtc(ctx->saved_crtc);
+        ctx->saved_crtc = NULL;
+    }
+
+    // 2. 释放所有的双缓冲/多缓冲资源
+    for (int i = 0; i < DRM_BUFFER_COUNT; i++) {
+        DrmBuffer *buf = &ctx->buffers[i];
+
+        // 解除用户空间映射
+        if (buf->vaddr && buf->vaddr != MAP_FAILED) {
+            munmap(buf->vaddr, buf->size);
+            buf->vaddr = NULL;
+        }
+        
+        // 关闭导出的 DMA FD
+        if (buf->dma_fd > 0) {
+            close(buf->dma_fd);
+            buf->dma_fd = -1;
+        }
+        
+        // 从 DRM 中移除 Framebuffer
+        if (buf->fb_id) {
+            drmModeRmFB(ctx->fd, buf->fb_id);
+            buf->fb_id = 0;
+        }
+        
+        // 销毁 DRM Dumb Buffer 对象
+        if (buf->handle) {
+            struct drm_mode_destroy_dumb dreq = { .handle = buf->handle };
+            ioctl(ctx->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+            buf->handle = 0;
+        }
+    }
+
+    if (ctx->fd > 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+
+    ctx->is_initialized = false;
+    return 0;
+}  ]]></display.c>
+  <frame_queue.c><![CDATA[
+#include "../include/frame_queue.h"
+#include <stdlib.h>
+
+int frame_queue_init(FrameQueue *queue, int capacity)
+{
+    if (!queue || capacity <= 0) return -1;
+
+    queue->frames = (Frame *)malloc(sizeof(Frame) * capacity);
+    if (!queue->frames) return -1;
+
+    queue->capacity = capacity;
+    queue->head = 0;
+    queue->tail = 0;
+    queue->count = 0;
+    queue->abort = false;
+
+    if (pthread_mutex_init(&queue->mutex, NULL) != 0) {
+        free(queue->frames);
+        return -1;
+    }
+    if (pthread_cond_init(&queue->empty, NULL) != 0) {
+        pthread_mutex_destroy(&queue->mutex);
+        free(queue->frames);
+        return -1;
+    }
+    return 0; 
+}
+
+int frame_queue_push(FrameQueue *queue, const Frame *frame)
+{
+    if (queue == NULL || frame == NULL) return -1;
+    
+    Frame dropped_frame;
+    bool did_drop = false;
+
+    pthread_mutex_lock(&queue->mutex);
+
+    if(queue->abort) {
+        pthread_mutex_unlock(&queue->mutex);
+        return -1;
+    }
+
+    if (queue->count >= queue->capacity) {
+        dropped_frame = queue->frames[queue->head];
+        queue->head = (queue->head + 1) % queue->capacity;
+        queue->count--;
+        did_drop = true; // 标记我们踢掉了一个老帧
+    }
+
+    queue->frames[queue->tail] = *frame;
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->count++;
+
+    pthread_cond_signal(&queue->empty);
+    pthread_mutex_unlock(&queue->mutex);
+
+    if (did_drop) {
+        frame_release(&dropped_frame);
+    }
+
+    return 0;
+}
+
+int frame_queue_pop(FrameQueue *queue, Frame *frame)
+{
+    if (queue == NULL || frame == NULL) return -1;
+    pthread_mutex_lock(&queue->mutex);
+
+    while (queue->count == 0 && !queue->abort) {
+        pthread_cond_wait(&queue->empty, &queue->mutex);
+    }
+    if(queue->abort) {
+        pthread_mutex_unlock(&queue->mutex);
+        return -1;
+    }
+    
+    *frame = queue->frames[queue->head];
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->count--;
+
+    pthread_mutex_unlock(&queue->mutex);
+    return 0;
+}
+
+int frame_queue_deinit(FrameQueue *queue)
+{
+    if (!queue) return -1;
+    
+    // 如果队列里还有没处理完的帧，必须释放，否则关机时会泄漏
+    while (queue->count > 0) {
+        Frame f = queue->frames[queue->head];
+        frame_release(&f);
+        queue->head = (queue->head + 1) % queue->capacity;
+        queue->count--;
+    }
+
+    pthread_cond_destroy(&queue->empty);
+    pthread_mutex_destroy(&queue->mutex);
+    
+    if (queue->frames) {
+        free(queue->frames);
+        queue->frames = NULL;
+    }
+    
+    queue->capacity = 0;
+    return 0;
+}
+
+int frame_queue_abort(FrameQueue *queue)
+{
+    pthread_mutex_lock(&queue->mutex);
+    queue->abort = true;
+    pthread_cond_broadcast(&queue->empty);
+    pthread_mutex_unlock(&queue->mutex);
+    return 0;
+}  ]]></frame_queue.c>
+  <main.c><![CDATA[
+#include "../include/camera.h"
+#include "../include/display.h"
+#include "../include/rga_process.h"
+#include "../include/frame_queue.h"
+#include "../include/common.h"
+#include "../include/mpp_encoder.h"
+
+#include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <signal.h>
+
+#define DEV_CAMERA                  "/dev/video11"
+#define DEV_DRM                     "/dev/dri/card0"
+#define VERSION                     "1.0：修改生命周期管理方式\n"
+
+#define CAM_WIDTH                   3840
+#define CAM_HEIGHT                  2160
+#define CAM_BUFFER_COUNT            4
+#define CAM_PIXEL_FMT               V4L2_PIX_FMT_NV12
+#define CAM_BUF_TYPE                V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+
+#define SIGNAL_CONTINUE             0
+#define SIGNAL_QUIT                 1
+
+#define CLIP(x)                     ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
+
+#define MPP_ENCODER_FPS             30
+
+#define QUEUE_LENTH_DISPLAY         4
+#define QUEUE_LENTH_ENCODE          4
+#define QUEUE_LENTH_AI              1
+
+
+
+pthread_mutex_t quitMutex = PTHREAD_MUTEX_INITIALIZER;
+volatile sig_atomic_t g_quit = SIGNAL_CONTINUE;
+
+typedef struct 
+{
+    DisplayContext  display;     // 显示硬件上下文
+    CameraContext   camera;      // 摄像头硬件上下文
+    EncoderContext  encoder;
+
+    FrameQueue      display_q;   // 显示线程循环队列
+    FrameQueue      encode_q;    // 编码线程循环队列
+    FrameQueue      ai_q;        // AI线程循环队列
+
+} appContext;
+
+
+int system_init(appContext *ctx, const char *dev_name_camera, const char *dev_name_display, uint32_t w, uint32_t h, 
+                uint32_t count, uint32_t pixel_format, uint32_t buf_type, uint32_t mpp_encoder_fps)
+{
+    if (camera_init(&ctx->camera, dev_name_camera, w, h, count, pixel_format, buf_type) < 0) return -1;
+    if (display_init(&ctx->display, dev_name_display) < 0) return -1;
+    if (mpp_encoder_init(&ctx->encoder, w, h, mpp_encoder_fps) < 0) return -1;
+    if (rga_process_init() < 0) return -1;
+
+    if (frame_queue_init(&ctx->display_q, QUEUE_LENTH_DISPLAY) < 0) return -1;
+    if (frame_queue_init(&ctx->encode_q , QUEUE_LENTH_ENCODE ) < 0) return -1;
+    if (frame_queue_init(&ctx->ai_q     , QUEUE_LENTH_AI     ) < 0) return -1;
+
+    return 0;
+}
+
+int system_deinit(appContext* ctx)
+{
+    camera_stop(&ctx->camera);
+    camera_deinit(&ctx->camera);
+    display_deinit(&ctx->display);
+    rga_process_deinit();
+    mpp_encoder_deinit(&ctx->encoder);
+
+    frame_queue_deinit(&ctx->display_q);
+    frame_queue_deinit(&ctx->encode_q );
+    frame_queue_deinit(&ctx->ai_q     );
+    return 0;
+}
+
+void handle_sigint(int sig) {
+    g_quit = SIGNAL_QUIT; 
+}
+
+void* cameraThread(void *arg) 
+{
+    appContext *ctx = (appContext *)arg;
+    if (camera_start(&ctx->camera) < 0) {
+        fprintf(stderr, "Camera 线程启动失败\n");
+        return NULL;
+    }
+    printf("[Camera] 线程已启动...\n");
+    while (g_quit == SIGNAL_CONTINUE) {
+        Frame frame;
+        if (camera_get_frame(&ctx->camera, &frame) < 0) {
+            if (errno == EINTR || g_quit == SIGNAL_QUIT) break;
+            usleep(10000); 
+            continue;
+        }
+
+#if THREAD_DISPLAY
+        frame_retain(&frame);
+        if (frame_queue_push(&ctx->display_q, &frame) < 0) {
+            frame_release(&frame);
+        }
+#endif
+
+#if THREAD_ENCODER
+        frame_retain(&frame);
+        if (frame_queue_push(&ctx->encode_q, &frame) < 0) {
+            frame_release(&frame);
+        }
+#endif
+
+#if THREAD_AI
+        frame_retain(&frame);
+        if (frame_queue_push(&ctx->ai_q, &frame) < 0) {
+            frame_release(&frame);
+        }
+#endif
+        frame_release(&frame); 
+    }
+
+    printf("[Camera] 线程安全退出。\n");
+    return NULL;
+}
+
+void* displayThread(void *arg) 
+{
+    appContext *ctx = (appContext *)arg;
+    printf("[Display] 线程已启动...\n");
+    while (g_quit == SIGNAL_CONTINUE) {
+        Frame cam_frame;
+        if (frame_queue_pop(&ctx->display_q, &cam_frame) < 0) {
+            break; 
+        }
+        Frame drm_frame;
+        if (display_get_back_frame(&ctx->display, &drm_frame) == 0) {
+            if (rga_process_convert_scale(&cam_frame, &drm_frame) == 0) {
+                frame_release(&cam_frame); 
+                display_show(&ctx->display);
+            } else {
+                frame_release(&cam_frame); 
+            }
+        } else {
+            frame_release(&cam_frame); 
+        }
+    }
+    printf("[Display] 线程安全退出。\n");
+    return NULL;
+}
+
+void* encoderThread(void *arg) 
+{
+    appContext *ctx = (appContext *)arg;
+    printf("[Encoder] 线程已启动...\n");
+    FILE *fp = fopen("record_output.h264", "wb");
+    if (!fp) {
+        perror("[Encoder] 创建视频文件失败");
+    }
+    if (fp && ctx->encoder.header_data && ctx->encoder.header_size > 0) {
+        fwrite(ctx->encoder.header_data, 1, ctx->encoder.header_size, fp);
+        fflush(fp); 
+    }
+
+    while (g_quit == SIGNAL_CONTINUE) {
+        Frame cam_frame;
+        if (frame_queue_pop(&ctx->encode_q, &cam_frame) < 0) {
+            break; 
+        }
+        EncodedPacket out_packet = {0};
+        if (mpp_encoder_encode(&ctx->encoder, &cam_frame, &out_packet) == 0) {
+            if (fp) {
+                fwrite(out_packet.data, 1, out_packet.length, fp);
+            }
+            mpp_encoder_release_packet(&out_packet);
+        }
+
+        frame_release(&cam_frame);
+    }
+
+    if (fp) {
+        fclose(fp);
+    }
+    printf("[Encoder] 线程安全退出。\n");
+    return NULL;
+}
+
+int main()
+{
+    printf(VERSION);
+    signal(SIGINT, handle_sigint);
+    
+    appContext ctx;
+    if (system_init(&ctx, DEV_CAMERA, DEV_DRM, CAM_WIDTH, CAM_HEIGHT, 
+                    CAM_BUFFER_COUNT, CAM_PIXEL_FMT, CAM_BUF_TYPE, MPP_ENCODER_FPS) < 0) {
+        return -1;
+    }
+    pthread_t tid_camera;
+    pthread_create(&tid_camera, NULL, cameraThread, &ctx);
+
+#if THREAD_DISPLAY
+    pthread_t tid_display;
+    pthread_create(&tid_display, NULL, displayThread, &ctx);
+#endif
+
+#if THREAD_ENCODER
+    pthread_t tid_encoder;
+    pthread_create(&tid_encoder, NULL, encoderThread, &ctx);
+#endif
+
+    while(g_quit == SIGNAL_CONTINUE) {
+        pause(); 
+    }
+
+#if THREAD_DISPLAY
+    frame_queue_abort(&ctx.display_q);
+    pthread_join(tid_display, NULL);
+#endif
+
+#if THREAD_ENCODER
+    frame_queue_abort(&ctx.encode_q);
+    pthread_join(tid_encoder, NULL);
+#endif
+
+#if THREAD_AI
+    frame_queue_abort(&ctx.ai_q);
+    pthread_join(tid_ai, NULL);
+#endif
+    camera_stop(&ctx.camera);
+    pthread_join(tid_camera, NULL);
+    system_deinit(&ctx);
+    printf("系统资源清理完毕，程序安全退出。\n");
+    return 0;
+}  ]]></main.c>
+  <mpp_encoder.c><![CDATA[
+#include "../include/mpp_encoder.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int mpp_encoder_init(EncoderContext *ctx, uint32_t width, uint32_t height, uint32_t fps)
+{
+    memset(ctx, 0, sizeof(EncoderContext));
+    ctx->width = width;
+    ctx->height = height;
+    ctx->fps = fps;
+    // 4K H.264 推荐码率，例如 10~20Mbps。这里设为 10Mbps
+    ctx->bps = 10 * 1024 * 1024; 
+
+    ctx->hor_stride = MPP_ALIGN(width, 16);
+    ctx->ver_stride = MPP_ALIGN(height, 16);
+
+    // 1. 创建 MPP 上下文和 API 接口
+    if (mpp_create(&ctx->ctx, &ctx->mpi) != MPP_OK) {
+        fprintf(stderr, "mpp_create failed\n");
+        return -1;
+    }
+
+    // 2. 初始化为 H.264 编码器
+    if (mpp_init(ctx->ctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC) != MPP_OK) {
+        fprintf(stderr, "mpp_init failed\n");
+        return -1;
+    }
+
+    // 3. 配置编码器参数
+    MppEncCfg cfg;
+    mpp_enc_cfg_init(&cfg);
+    
+    // 设置分辨率和格式 (假设输入严格为 NV12，对应 MPP_FMT_YUV420SP)
+    mpp_enc_cfg_set_s32(cfg, "prep:width", width);
+    mpp_enc_cfg_set_s32(cfg, "prep:height", height);
+
+    mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", ctx->hor_stride);
+    mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", ctx->ver_stride);
+    mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
+
+    // 设置码率控制 (CBR - 恒定码率)
+    mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+    mpp_enc_cfg_set_s32(cfg, "rc:bps_target", ctx->bps);
+    mpp_enc_cfg_set_s32(cfg, "rc:bps_max", ctx->bps * 1.2);
+    mpp_enc_cfg_set_s32(cfg, "rc:bps_min", ctx->bps * 0.8);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm", 1);
+    mpp_enc_cfg_set_s32(cfg, "rc:gop", fps * 2); // 2秒一个I帧
+
+    ctx->mpi->control(ctx->ctx, MPP_ENC_SET_CFG, cfg);
+    mpp_enc_cfg_deinit(cfg);
+
+    // 4. 获取 SPS/PPS 头 (H.264 解码必备)
+    MppPacket packet = NULL;
+    ctx->mpi->control(ctx->ctx, MPP_ENC_GET_EXTRA_INFO, &packet);
+    if (packet) {
+        ctx->header_size = mpp_packet_get_length(packet);
+        ctx->header_data = malloc(ctx->header_size);
+        memcpy(ctx->header_data, mpp_packet_get_pos(packet), ctx->header_size);
+        // header_data 需要在推流或写入文件时放在最开头
+        mpp_packet_deinit(&packet);
+    }
+
+    // 5. 创建用于导入 DMA FD 的 Buffer Group
+    mpp_buffer_group_get_internal(&ctx->buf_grp, MPP_BUFFER_TYPE_EXT_DMA);
+
+    return 0;
+}
+
+int mpp_encoder_encode(EncoderContext *ctx, const Frame *in_frame, EncodedPacket *out_packet)
+{
+    if (!ctx || !out_packet) return -1;
+
+    MppBuffer mpp_buf = NULL;
+    MppFrame mpp_frame = NULL;
+    MppPacket mpp_packet = NULL;
+
+    // 1. 将 DMA FD 导入为 MppBuffer
+    MppBufferInfo info;
+    memset(&info, 0, sizeof(info));
+    info.type = MPP_BUFFER_TYPE_EXT_DMA;
+    info.fd = in_frame->dma_fd;
+
+    info.size = ctx->hor_stride * ctx->ver_stride * 3 / 2; 
+    info.index = in_frame->index;
+
+    // import_with_tag 实现了零拷贝，MPP 底层直接操作摄像头的物理内存
+    mpp_buffer_import_with_tag(ctx->buf_grp, &info, &mpp_buf, "camera_in", __func__);
+
+    // 2. 初始化并设置 MppFrame
+    mpp_frame_init(&mpp_frame);
+    mpp_frame_set_width(mpp_frame, in_frame->width);
+    mpp_frame_set_height(mpp_frame, in_frame->height);
+    mpp_frame_set_hor_stride(mpp_frame, ctx->hor_stride);
+    mpp_frame_set_ver_stride(mpp_frame, ctx->ver_stride);
+    mpp_frame_set_fmt(mpp_frame, MPP_FMT_YUV420SP);
+    mpp_frame_set_pts(mpp_frame, in_frame->timestamp);
+    mpp_frame_set_buffer(mpp_frame, mpp_buf);
+
+    // 3. 送入编码器
+    if (ctx->mpi->encode_put_frame(ctx->ctx, mpp_frame) != MPP_OK) {
+        fprintf(stderr, "MPP put frame failed\n");
+        mpp_frame_deinit(&mpp_frame);
+        mpp_buffer_put(mpp_buf);
+        return -1;
+    }
+
+    // 清理送入帧的结构 (MPP 内部已持有引用)
+    mpp_frame_deinit(&mpp_frame);
+    if (mpp_buf) mpp_buffer_put(mpp_buf);
+
+    // 4. 获取编码后的码流
+    int retry_count = 0;
+    const int max_retries = 100; // 最长等待约 200ms
+    do {
+        if (ctx->mpi->encode_get_packet(ctx->ctx, &mpp_packet) == MPP_OK && mpp_packet != NULL) {
+            break; // 成功获取到包
+        }
+        usleep(2000); // 等待 2ms 再试
+        retry_count++;
+    } while (retry_count < max_retries);
+
+    if (mpp_packet == NULL) {
+        fprintf(stderr, "MPP get packet timeout\n");
+        return -1;
+    }
+
+    // 5. 填充输出结构
+    out_packet->data = mpp_packet_get_pos(mpp_packet);
+    out_packet->length = mpp_packet_get_length(mpp_packet);
+    out_packet->pts = mpp_packet_get_pts(mpp_packet);
+    
+    // 判断是否为关键帧 (I 帧)
+    uint32_t meta = mpp_packet_get_flag(mpp_packet);
+    out_packet->is_keyframe = (meta & MPP_PACKET_FLAG_INTRA) ? true : false;
+    
+    // 保存 packet 指针，外部处理完后需要释放
+    out_packet->packet = mpp_packet; 
+
+    return 0;
+}
+// 处理完 EncodedPacket 后调用
+void mpp_encoder_release_packet(EncodedPacket *packet)
+{
+    if (packet && packet->packet) {
+        mpp_packet_deinit(&packet->packet);
+        packet->packet = NULL;
+    }
+}
+
+int mpp_encoder_deinit(EncoderContext *ctx)
+{
+    if (!ctx) return 0;
+
+    if (ctx->mpi) {
+        ctx->mpi->reset(ctx->ctx);
+        mpp_destroy(ctx->ctx);
+        ctx->mpi = NULL;
+        ctx->ctx = NULL;
+    }
+
+    if (ctx->buf_grp) {
+        mpp_buffer_group_put(ctx->buf_grp);
+        ctx->buf_grp = NULL;
+    }
+
+    if (ctx->header_data) {
+        free(ctx->header_data);
+        ctx->header_data = NULL;
+    }
+
+    return 0;
+}  ]]></mpp_encoder.c>
+  <rga_process.c><![CDATA[
+#include "../include/rga_process.h"
+
+int rga_process_init()
+{
+    return c_RkRgaInit();
+}
+
+int rga_process_convert_scale(const Frame *src_frame, const Frame *dst_frame)
+{
+    rga_info_t src = {0};
+    rga_info_t dst = {0};
+    
+    // 源图信息 (使用 DMA FD)
+    src.fd = src_frame->dma_fd;
+    src.mmuFlag = 1;
+    src.format = RK_FORMAT_YCbCr_420_SP; // NV12
+    rga_set_rect(&src.rect, 0, 0, src_frame->width, src_frame->height,  src_frame->width, src_frame->height, RK_FORMAT_YCbCr_420_SP);
+
+    // 目标图信息 (使用 DMA FD)
+    dst.fd = dst_frame->dma_fd;
+    dst.mmuFlag = 1;
+    dst.format = RK_FORMAT_BGRA_8888;
+    rga_set_rect(&dst.rect, 0, 0, dst_frame->width, dst_frame->height,  dst_frame->width, dst_frame->height, RK_FORMAT_BGRA_8888);
+
+    if (c_RkRgaBlit(&src, &dst, NULL) < 0) {
+        fprintf(stderr, "RGA Blit 失败\n");
+        return -1;
+    }
+    return 0;
+}
+
+void rga_process_deinit()
+{
+    c_RkRgaDeInit();
+}  ]]></rga_process.c>
+</src>

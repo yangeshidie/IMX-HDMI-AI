@@ -12,6 +12,7 @@
 #include <rockchip/mpp_packet.h> 
 #include <rockchip/mpp_frame.h>
 #include <rockchip/mpp_err.h>
+#include <unistd.h>
 
 #include "common.h" 
 
