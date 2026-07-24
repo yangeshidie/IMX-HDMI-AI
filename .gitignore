@@ -1,14 +1,18 @@
-*.vscode
-config.mk
-
 *.o
 *.a
 *.so
+*.dylib
 *.d
+*.o.d
 
 *
 !*.*
 !*/
+
+.vscode/
+.idea/
+config.mk
+output_result.txt
 
 !Makefile
 !makefile

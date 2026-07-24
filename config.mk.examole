@@ -1,3 +1,4 @@
 REMOTE_USER = xxx               # 登录用户名
 REMOTE_IP = xxx.xxx.xxx.xxx     # IP地址
 REMOTE_PATH = /home/xxx         # 路径
+SYSROOT = /home/user/SDK        # 库目录
