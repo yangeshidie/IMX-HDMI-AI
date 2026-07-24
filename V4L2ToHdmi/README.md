@@ -51,12 +51,12 @@
 
 | 文件名                                                                                               | 对应生成目标           | 阶段定位                              | 功能描述                                                                                                     |
 | :--------------------------------------------------------------------------------------------------- | :--------------------- | :------------------------------------ | :----------------------------------------------------------------------------------------------------------- |
-| [camera_test.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/camera_test.c)           | `TEST_DEVICE_CAMERA` | **阶段 1：设备探查**            | 探测摄像头节点（如`/dev/video11`），查询单平面/多平面 (MPLANE) 模式下的长宽分辨率及像素格式。              |
-| [drm_green.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/drm_green.c)               | `TEST_PURE_GREEN`    | **阶段 2：DRM 通路验证**        | 初始化 DRM/KMS 通路，申请 Dumb Buffer 显存并由 CPU 填充纯绿像素推送上屏，5 秒后自动还原原始屏幕状态。        |
-| [drm_Aframe.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/drm_Aframe.c)             | `TEST_A_FRAME`       | **阶段 3：V4L2+DRM CPU联调**    | 采集单帧 4K NV12 图像，通过**CPU 纯软件算法** 进行 NV12 到 XRGB8888 的格式转换与图像缩放，并推送显示。 |
-| [drm_Aframe_RGA.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/drm_Aframe_RGA.c)     | `TEST_A_FRAME_RGA`   | **阶段 4：CPU vs RGA 单帧对比** | 引入 RGA 硬件 Blit 加速与 DMA-BUF 交互，高精度测量并输出单帧场景下 CPU 与 RGA 的转换耗时对比。               |
-| [final_video_test.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/final_video_test.c) | `FINAL`              | **阶段 5：综合压测与长测**      | 包含 15s 连续视频流实时测试、单帧极限吞吐量压测及 15 分钟 RGA 连续稳定性长测。支持参数化切换。               |
-| [Makefile](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/Makefile)                     | N/A                    | **构建与部署工程**              | 交叉编译 Makefile，包含依赖链接配置及自动 SCP 推送与 SSH 远程一键运行工具链。                                |
+| [camera_test.c](./camera_test.c)           | `TEST_DEVICE_CAMERA` | **阶段 1：设备探查**            | 探测摄像头节点（如`/dev/video11`），查询单平面/多平面 (MPLANE) 模式下的长宽分辨率及像素格式。              |
+| [drm_green.c](./drm_green.c)               | `TEST_PURE_GREEN`    | **阶段 2：DRM 通路验证**        | 初始化 DRM/KMS 通路，申请 Dumb Buffer 显存并由 CPU 填充纯绿像素推送上屏，5 秒后自动还原原始屏幕状态。        |
+| [drm_Aframe.c](./drm_Aframe.c)             | `TEST_A_FRAME`       | **阶段 3：V4L2+DRM CPU联调**    | 采集单帧 4K NV12 图像，通过**CPU 纯软件算法** 进行 NV12 到 XRGB8888 的格式转换与图像缩放，并推送显示。 |
+| [drm_Aframe_RGA.c](./drm_Aframe_RGA.c)     | `TEST_A_FRAME_RGA`   | **阶段 4：CPU vs RGA 单帧对比** | 引入 RGA 硬件 Blit 加速与 DMA-BUF 交互，高精度测量并输出单帧场景下 CPU 与 RGA 的转换耗时对比。               |
+| [final_video_test.c](./final_video_test.c) | `FINAL`              | **阶段 5：综合压测与长测**      | 包含 15s 连续视频流实时测试、单帧极限吞吐量压测及 15 分钟 RGA 连续稳定性长测。支持参数化切换。               |
+| [Makefile](./Makefile)                     | N/A                    | **构建与部署工程**              | 交叉编译 Makefile，包含依赖链接配置及自动 SCP 推送与 SSH 远程一键运行工具链。                                |
 
 ---
 
@@ -79,7 +79,7 @@
 
 ### 3. DMA-BUF 与 RGA 硬件 2D 加速 (Zero-Copy)
 
-在 [drm_Aframe_RGA.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/drm_Aframe_RGA.c) 及 [final_video_test.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/final_video_test.c) 中：
+在 [drm_Aframe_RGA.c](./drm_Aframe_RGA.c) 及 [final_video_test.c](./final_video_test.c) 中：
 
 - 摄像头帧缓冲区与 DRM 显存均导出为 DMA-BUF FD (`src.fd` 和 `dst.fd`)。
 - 硬件 2D 加速核心代码调用瑞芯微 RGA API `c_RkRgaBlit(&src, &dst, NULL)`。
@@ -162,7 +162,7 @@ make run
 
 ### 综合压测程序 `FINAL`
 
-[final_video_test.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/final_video_test.c) 生成的程序 `FINAL` 支持通过命令行参数传入指定的测试模式：
+[final_video_test.c](./final_video_test.c) 生成的程序 `FINAL` 支持通过命令行参数传入指定的测试模式：
 
 ```bash
 ./FINAL [测试模式]
@@ -194,7 +194,7 @@ make run
 ## 常见问题排查
 
 1. **打开设备失败 (`/dev/video11` 或 `/dev/dri/card0`)**
-   - 请检查摄像头节点是否正确绑定。由于不同的 Rockchip BSP 驱动配置不同，摄像头节点可能是 `/dev/video0`、`/dev/video8` 或 `/dev/video11`，可在 [camera_test.c](file:///C:/Users/Mobile/Desktop/32165/IMX-HDMI-AI/V4L2ToHdmi/camera_test.c) 或配置头中进行修正。
+   - 请检查摄像头节点是否正确绑定。由于不同的 Rockchip BSP 驱动配置不同，摄像头节点可能是 `/dev/video0`、`/dev/video8` 或 `/dev/video11`，可在 [camera_test.c](./camera_test.c) 或配置头中进行修正。
    - 请确保运行身份具备 root 权限或关联设备文件权限。
 2. **RGA Blit 失败**
    - 检查系统 `librga` 驱动及核心模块是否正常加载（如 `/dev/rga` 节点是否存在）。
